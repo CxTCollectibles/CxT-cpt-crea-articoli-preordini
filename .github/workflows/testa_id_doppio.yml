@@ -1,0 +1,51 @@
+name: Testa ID Wix (siteId vs metaSiteId)
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_id:
+        description: "siteId (dall'URL editor, la parte nel path)"
+        required: true
+        default: "ceeb6974-352a-44b5-be03-54ee80e25169"
+      meta_site_id:
+        description: "metaSiteId (dall'URL editor, parametro metaSiteId=...)"
+        required: true
+        default: "7368e0dc-42db-4085-8a93-c0870ade7ec8"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prova con siteId (di solito fallisce)
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ github.event.inputs.site_id }}
+        run: |
+          set -e
+          echo "Test con wix-site-id=$WIX_SITE_ID (siteId)"
+          code=$(curl -s -o /tmp/out1.json -w "%{http_code}" \
+            -X POST "https://www.wixapis.com/stores/v1/products/query" \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "wix-site-id: $WIX_SITE_ID" \
+            -d '{"query":{}}')
+          echo "HTTP $code"; head -c 400 /tmp/out1.json || true; echo
+
+      - name: Prova con metaSiteId (quello giusto)
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ github.event.inputs.meta_site_id }}
+        run: |
+          set -e
+          echo "Test con wix-site-id=$WIX_SITE_ID (metaSiteId)"
+          code=$(curl -s -o /tmp/out2.json -w "%{http_code}" \
+            -X POST "https://www.wixapis.com/stores/v1/products/query" \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "wix-site-id: $WIX_SITE_ID" \
+            -d '{"query":{}}')
+          echo "HTTP $code"; head -c 400 /tmp/out2.json || true; echo
+          if [ "$code" -ge 300 ]; then
+            echo "Ancora errore: la chiave non ha permessi di LETTURA (403) o è sbagliata (401)."
+            exit 1
+          fi
