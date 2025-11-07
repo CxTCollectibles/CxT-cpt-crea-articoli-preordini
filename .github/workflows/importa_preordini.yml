@@ -77,7 +77,6 @@ jobs:
           # 3) Percorso nel repo: csv_dir + csv_name (input/ è già preimpostato)
           dir="${{ github.event.inputs.csv_dir }}"
           name="${{ github.event.inputs.csv_name }}"
-          # se l'utente ha lasciato vuoto csv_name, prova a prendere l'ultimo file nella cartella
           if [ -z "$name" ]; then
             latest=$(ls -t "$dir"/*.csv 2>/dev/null | head -n1 || true)
             if [ -z "$latest" ]; then
@@ -88,7 +87,6 @@ jobs:
             echo "source=latest_in_dir" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # aggiungi .csv se l'utente ha scritto solo il nome senza estensione
           if [[ "$name" != *.csv ]]; then
             name="${name}.csv"
           fi
@@ -108,6 +106,17 @@ jobs:
         run: |
           python wix_preorder_ingestion.py --csv "${{ steps.prep.outputs.csv }}"
 
-      - name: Esito
+      - name: Riepilogo
+        if: always()
         run: |
           echo "CSV usato: ${{ steps.prep.outputs.csv }} (source=${{ steps.prep.outputs.source }})"
+          echo "--- created_products.json ---"
+          test -f created_products.json && cat created_products.json || echo "Nessun file di riepilogo trovato"
+
+      - name: Upload artifact (prodotti creati)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: created_products
+          path: created_products.json
+          if-no-files-found: warn
