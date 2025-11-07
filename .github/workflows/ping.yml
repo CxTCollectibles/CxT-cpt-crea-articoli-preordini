@@ -1,9 +1,6 @@
 name: Ping Actions
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/ping.yml"
 
 jobs:
   ping:
