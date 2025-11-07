@@ -79,7 +79,7 @@ def fetch_from_page(url):
 
         # Text search for EAN/SKU/weight
         text = soup.get_text("\n", strip=True)
-        m = re.search(r"\b(\d{13})\b", text)
+        m = re.search(r"\b(\d{8,14})\b", text)
         if m: out["ean"] = m.group(1)
         for pat in [r"SKU[:\s]+([A-Z0-9\-\._/]+)", r"Cod(?:ice)?\s*[:\s]+([A-Z0-9\-\._/]+)"]:
             m = re.search(pat, text, re.I)
@@ -97,132 +97,68 @@ def wix_request(method, url, api_key, site_id, payload=None):
     headers = {"Content-Type":"application/json", "Authorization": api_key, "wix-site-id": site_id}
     r = requests.request(method, url, headers=headers, data=(json.dumps(payload) if payload else None), timeout=30)
     if r.status_code >= 300:
-        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:500]}")
     return r.json()
 
-def find_or_create_collection(api_key, site_id, name):
-    try:
-        res = wix_request("POST","https://www.wixapis.com/stores/v1/collections/query", api_key, site_id,
-                          {"query":{"filter": json.dumps({"name":{"$eq": name}})}, "paging":{"limit":100}})
-        items = res.get("collections",[]) or res.get("items",[])
-        for c in items:
-            if c.get("name","").strip().lower() == name.strip().lower():
-                return c.get("id")
-    except Exception as e:
-        print(f"[WARN] Query collections: {e}")
-    try:
-        res = wix_request("POST","https://www.wixapis.com/stores/v1/collections", api_key, site_id, {"collection":{"name": name}})
-        return res.get("collection",{}).get("id") or res.get("id")
-    except Exception as e:
-        print(f"[WARN] Create collection '{name}': {e}")
-        return None
-
-def add_product_to_collection(api_key, site_id, col_id, product_id):
-    if not col_id or not product_id: return
-    try:
-        wix_request("POST", f"https://www.wixapis.com/stores/v1/collections/{col_id}/productIds", api_key, site_id, {"productIds":[product_id]})
-    except Exception as e:
-        print(f"[WARN] Add to collection: {e}")
-
-# ---------- Main ----------
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--csv", required=True)
-    args = p.parse_args()
-
-    api_key = os.getenv("WIX_API_KEY","").strip()
-    site_id = os.getenv("WIX_SITE_ID","").strip()
-    if not api_key or not site_id:
-        print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come secrets/env.")
-        sys.exit(1)
-
-    created = []
-    for rownum, r in read_rows(args.csv):
-        name = r.get("nome_articolo")
-        try:
-            price = float((r.get("prezzo_eur") or "0").replace(",",".")); assert price>0
-        except:
-            print(f"[ERRORE] Riga {rownum}: prezzo non valido"); continue
-
-        urlp = r.get("url_produttore")
-        if not re.match(r"^https?://", urlp or ""):
-            print(f"[ERRORE] Riga {rownum}: url_produttore non valido"); continue
-
-        sku  = r.get("sku") or None
-        ean  = r.get("gtin_ean") or None
-        peso = to_float(r.get("peso_kg"))
-        descr= r.get("descrizione") or ""
-        tipo = (r.get("tipo_articolo") or "PREORDER").upper()
-        is_preorder = tipo == "PREORDER"
-
-        scraped = fetch_from_page(urlp) if urlp else {}
-        if not descr: descr = scraped.get("description") or ""
-        if peso is None: peso = scraped.get("weight_kg")
-        ean = ean or scraped.get("ean")
-        sku = sku or scraped.get("sku")
-
-        dep, full = compute_prices(price) if is_preorder else (None, None)
-        slug = f"{slugify(name)}-{sku.lower()}" if sku else slugify(name)
-
-        product = {
-            "name": name,
-            "slug": slug,
+# ---------- Creator: prova V3 e fallback V1 ----------
+def create_product_dual(api_key, site_id, p, is_preorder, peso):
+    # Payload stile V3
+    p_v3 = {
+        "product": {
+            "name": p["name"],
+            "slug": p["slug"],
             "visible": True,
-            "description": descr,
-            "price": price,
-            "inventory": {"trackQuantity": False},
-            "manageVariants": bool(is_preorder),
-            "ribbon": "PREORDER" if is_preorder else "",
-            "mediaItems": [{"src": u} for u in (scraped.get("images") or [])[:10]]
+            "productType": "physical",
+            "description": p.get("description") or "",
+            "media": {"items": [{"src": u} for u in (p.get("images") or [])[:10]]},
         }
-        if is_preorder:
-            product["productOptions"] = [{
-                "name":"PREORDER PAYMENTS OPTIONS",
-                "choices":[{"value":"ANTICIPO/SALDO"},{"value":"PAGAMENTO ANTICIPATO"}]
-            }]
-            product["variants"] = [
-                {"choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"}, "price": dep,  "sku": f"{sku}-DEP" if sku else None,  "weight": peso},
-                {"choices":{"PREORDER PAYMENTS OPTIONS":"PAGAMENTO ANTICIPATO"}, "price": full, "sku": f"{sku}-FULL" if sku else None, "weight": peso}
-            ]
+    }
+    if is_preorder:
+        p_v3["product"]["ribbon"] = "PREORDER"
+        p_v3["product"]["productOptions"] = [{
+            "name": "PREORDER PAYMENTS OPTIONS",
+            "choices": [{"value":"ANTICIPO/SALDO"}, {"value":"PAGAMENTO ANTICIPATO"}]
+        }]
+        # Varianti con priceData
+        dep, full = compute_prices(p["price"])
+        p_v3["product"]["variants"] = [
+            {"choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"}, "priceData":{"price": dep},  "sku": f"{p['sku']}-DEP" if p.get("sku") else None, "physicalProperties":{"weight": peso} if peso is not None else None},
+            {"choices":{"PREORDER PAYMENTS OPTIONS":"PAGAMENTO ANTICIPATO"}, "priceData":{"price": full}, "sku": f"{p['sku']}-FULL" if p.get("sku") else None, "physicalProperties":{"weight": peso} if peso is not None else None}
+        ]
+    else:
+        p_v3["product"]["priceData"] = {"price": p["price"]}
+        if peso is not None:
+            p_v3["product"]["physicalProperties"] = {"weight": peso}
+
+    # Prova V3
+    try:
+        res = wix_request("POST", "https://www.wixapis.com/stores/v3/products", api_key, site_id, p_v3)
+        pid = res.get("product",{}).get("id")
+        if pid:
+            print("[INFO] Creato via Catalog V3")
+            return pid, res
         else:
-            if peso is not None: product["weight"] = peso
-            product["productOptions"] = []
-            product["variants"] = []
+            print("[WARN] V3 senza product.id, provo V1… ->", str(res)[:200])
+    except Exception as e:
+        print("[WARN] V3 fallita, provo V1…", e)
 
-        custom = []
-        if ean: custom.append({"name":"EAN","value":ean})
-        if sku: custom.append({"name":"SKU","value":sku})
-        if custom: product["customTextFields"] = custom
-
-        try:
-            res = wix_request("POST","https://www.wixapis.com/stores/v1/products", api_key, site_id, {"product": product})
-            pid = res.get("product",{}).get("id")
-            if not pid:
-                print(f"[ERRORE] Riga {rownum}: risposta senza product.id -> {json.dumps(res)[:300]}")
-                continue
-            print(f"[OK] Riga {rownum} creato prodotto id={pid} :: {name}")
-            created.append({"row": rownum, "id": pid, "name": name, "slug": slug})
-        except Exception as e:
-            print(f"[ERRORE] Riga {rownum} '{name}': {e}")
-            continue
-
-        cat = (r.get("categoria") or "").strip()
-        br  = (r.get("brand") or "").strip()
-        if cat:
-            cid = find_or_create_collection(api_key, site_id, cat)
-            add_product_to_collection(api_key, site_id, cid, pid)
-        if br:
-            bid = find_or_create_collection(api_key, site_id, f"Brand: {br}")
-            add_product_to_collection(api_key, site_id, bid, pid)
-
-    # Salva riepilogo creazioni
-    with open("created_products.json", "w", encoding="utf-8") as f:
-        json.dump({"created": created}, f, ensure_ascii=False, indent=2)
-
-    if not created:
-        print("[ERRORE] Nessun prodotto creato.")
-        sys.exit(2)
-
-# ---------- Entry ----------
-if __name__ == "__main__":
-    main()
+    # Payload stile V1 (minimal-compat)
+    p_v1 = {
+        "product": {
+            "name": p["name"],
+            "slug": p["slug"],
+            "visible": True,
+            "description": p.get("description") or "",
+            "mediaItems": [{"src": u} for u in (p.get("images") or [])[:10]],
+        }
+    }
+    if is_preorder:
+        dep, full = compute_prices(p["price"])
+        p_v1["product"]["ribbons"] = [{"text":"PREORDER"}]
+        p_v1["product"]["productOptions"] = [{
+            "name": "PREORDER PAYMENTS OPTIONS",
+            "choices": [{"value":"ANTICIPO/SALDO"}, {"value":"PAGAMENTO ANTICIPATO"}]
+        }]
+        p_v1["product"]["manageVariants"] = True
+        p_v1["product"]["variants"] = [
+            {"choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"},
