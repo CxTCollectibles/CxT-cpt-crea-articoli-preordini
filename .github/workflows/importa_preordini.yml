@@ -3,16 +3,23 @@ name: Importa Preordini su Wix
 on:
   workflow_dispatch:
     inputs:
-      csv_path:
-        description: "Percorso CSV nel repo (es. input/miofile.csv)"
+      # Opzione A: file nel repo (consigliata)
+      csv_dir:
+        description: "Cartella nel repo (lascia input/)"
+        required: true
+        default: "input/"
+      csv_name:
+        description: "Nome del file CSV (es. template_preordini_v5.csv)"
         required: false
         default: ""
+      # Opzione B: URL pubblico del CSV
       csv_url:
-        description: "URL pubblico del CSV (verrà scaricato al volo)"
+        description: "URL pubblico del CSV (alternativa a csv_dir/csv_name)"
         required: false
         default: ""
+      # Opzione C: incolla il contenuto del CSV
       csv_inline:
-        description: "Incolla qui il contenuto CSV (opzionale)"
+        description: "Incolla qui il contenuto CSV (alternativa a csv_dir/csv_name)"
         required: false
         default: ""
   push:
@@ -36,6 +43,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
+      - name: Debug repo tree
+        run: |
+          echo "Contenuto repo:"
+          ls -la
+          echo "Contenuto input/:"
+          ls -la input || true
+
       - name: Prepare CSV
         id: prep
         shell: bash
@@ -43,7 +57,7 @@ jobs:
           set -e
           mkdir -p input
 
-          # 1) Contenuto incollato (prioritario)
+          # 1) Contenuto incollato (priorità massima)
           if [ -n "${{ github.event.inputs.csv_inline }}" ]; then
             printf "%s" "${{ github.event.inputs.csv_inline }}" > input/inline.csv
             echo "csv=input/inline.csv" >> $GITHUB_OUTPUT
@@ -60,25 +74,32 @@ jobs:
             exit 0
           fi
 
-          # 3) Percorso nel repo
-          if [ -n "${{ github.event.inputs.csv_path }}" ]; then
-            if [ ! -f "${{ github.event.inputs.csv_path }}" ]; then
-              echo "File non trovato: ${{ github.event.inputs.csv_path }}" >&2
+          # 3) Percorso nel repo: csv_dir + csv_name (input/ è già preimpostato)
+          dir="${{ github.event.inputs.csv_dir }}"
+          name="${{ github.event.inputs.csv_name }}"
+          # se l'utente ha lasciato vuoto csv_name, prova a prendere l'ultimo file nella cartella
+          if [ -z "$name" ]; then
+            latest=$(ls -t "$dir"/*.csv 2>/dev/null | head -n1 || true)
+            if [ -z "$latest" ]; then
+              echo "Nessun CSV trovato in $dir. Carica un file o usa csv_url/csv_inline." >&2
               exit 1
             fi
-            echo "csv=${{ github.event.inputs.csv_path }}" >> $GITHUB_OUTPUT
-            echo "source=path" >> $GITHUB_OUTPUT
+            echo "csv=$latest" >> $GITHUB_OUTPUT
+            echo "source=latest_in_dir" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          # 4) Fallback: ultimo CSV in input/
-          latest=$(ls -t input/*.csv 2>/dev/null | head -n1 || true)
-          if [ -z "$latest" ]; then
-            echo "Nessun CSV fornito e nessun file in input/. Carica un CSV o usa csv_url/csv_inline." >&2
+          # aggiungi .csv se l'utente ha scritto solo il nome senza estensione
+          if [[ "$name" != *.csv ]]; then
+            name="${name}.csv"
+          fi
+          path="${dir%/}/$name"
+          if [ ! -f "$path" ]; then
+            echo "File non trovato: $path" >&2
+            echo "Suggerimento: carica il file in $dir o usa csv_inline/csv_url." >&2
             exit 1
           fi
-          echo "csv=$latest" >> $GITHUB_OUTPUT
-          echo "source=latest" >> $GITHUB_OUTPUT
+          echo "csv=$path" >> $GITHUB_OUTPUT
+          echo "source=dir+name" >> $GITHUB_OUTPUT
 
       - name: Run importer
         env:
