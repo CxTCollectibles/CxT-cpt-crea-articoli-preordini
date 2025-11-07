@@ -2,6 +2,9 @@
 import os, sys, csv, re, json, argparse, requests
 from bs4 import BeautifulSoup
 
+ARTDIR = "artifacts"
+os.makedirs(ARTDIR, exist_ok=True)
+
 # ---------- Utilità ----------
 def slugify(s):
     import unicodedata, re
@@ -26,7 +29,6 @@ def compute_prices(price):
     return round(price*0.30,2), round(price*0.95,2)
 
 def prune(x):
-    # rimuove None/str vuote/strutture vuote
     if isinstance(x, dict):
         out = {}
         for k,v in x.items():
@@ -102,13 +104,23 @@ def wix_request(method, url, api_key, site_id, payload=None):
     data = json.dumps(prune(payload)) if payload is not None else None
     r = requests.request(method, url, headers=headers, data=data, timeout=40)
     if r.status_code >= 300:
-        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:800]}")
+        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:1200]}")
     return r.json()
 
-# ---------- API V1 ----------
+# Pre-check credenziali/tenant
+def precheck(api_key, site_id):
+    try:
+        res = wix_request("POST", "https://www.wixapis.com/stores/v1/products/query", api_key, site_id, {"query":{}})
+        items = res.get("products") or res.get("items") or []
+        print(f"[PRECHECK] API ok. Prodotti visibili: {len(items)}")
+        return True
+    except Exception as e:
+        print(f"[PRECHECK] FALLITO: {e}")
+        return False
+
+# API V1
 def create_product_v1(api_key, site_id, product):
-    payload = {"product": product}
-    return wix_request("POST", "https://www.wixapis.com/stores/v1/products", api_key, site_id, payload)
+    return wix_request("POST", "https://www.wixapis.com/stores/v1/products", api_key, site_id, {"product": product})
 
 def add_media_v1(api_key, site_id, product_id, urls):
     if not urls: return
@@ -151,12 +163,17 @@ def main():
 
     api_key = os.getenv("WIX_API_KEY","").strip()
     site_id = os.getenv("WIX_SITE_ID","").strip()
+    dry = os.getenv("DRY_RUN","0").strip() == "1"
+
     if not api_key or not site_id:
-        print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come secrets/env.")
+        print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come env (WIX_SITE_ID lo passa il workflow).")
         sys.exit(1)
 
+    if not precheck(api_key, site_id):
+        sys.exit(3)
+
     created = []
-    with open(args.csv, "rb") as _f: pass  # fail-fast se il file non esiste
+    with open(args.csv, "rb") as _f: pass  # fail-fast
 
     for rownum, r in read_rows(args.csv):
         name = r.get("nome_articolo")
@@ -183,13 +200,12 @@ def main():
 
         slug = f"{slugify(name)}-{sku.lower()}" if sku else slugify(name)
 
-        # Base product (V1) con priceData sempre presente
         product = {
             "name": name,
             "slug": slug,
             "visible": True,
             "description": descr,
-            "priceData": {"price": price},
+            "priceData": {"price": price}
         }
 
         if is_preorder:
@@ -212,32 +228,39 @@ def main():
                  **({"sku": f"{sku}-FULL"} if sku else {}),
                  **({"weight": peso} if peso is not None else {})}
             ]
-        else:
-            # singola variante implicita; opzionalmente sku/weight sul prodotto sono ignorati,
-            # gestiti a livello variante dal sistema.
-            pass
+
+        # payload su file
+        pay_path = os.path.join(ARTDIR, f"payload_row_{rownum}.json")
+        with open(pay_path, "w", encoding="utf-8") as f:
+            json.dump({"product": product}, f, ensure_ascii=False, indent=2)
+
+        if dry:
+            print(f"[DRY-RUN] Riga {rownum}: simulazione, payload in {pay_path}")
+            continue
 
         try:
             res = create_product_v1(api_key, site_id, product)
             pid = res.get("product",{}).get("id")
+            with open(os.path.join(ARTDIR, f"response_row_{rownum}.json"), "w", encoding="utf-8") as f:
+                json.dump(res, f, ensure_ascii=False, indent=2)
             if not pid:
-                print(f"[ERRORE] Riga {rownum}: risposta senza product.id -> {json.dumps(res)[:300]}")
+                print(f"[ERRORE] Riga {rownum}: risposta senza product.id (vedi artifacts/response_row_{rownum}.json)")
                 continue
             print(f"[OK] Riga {rownum} creato prodotto id={pid} :: {name}")
         except Exception as e:
+            with open(os.path.join(ARTDIR, f"response_row_{rownum}.json"), "w", encoding="utf-8") as f:
+                f.write(str(e))
             print(f"[ERRORE] Riga {rownum} '{name}': {e}")
             continue
 
-        # Media dopo creazione (endpoint dedicato V1)
         try:
             add_media_v1(api_key, site_id, pid, images)
         except Exception as e:
             print(f"[WARN] Immagini non aggiunte: {e}")
 
-        # Collezioni: Categoria + Brand
-        cat = (r.get("categoria") or "").strip()
-        br  = (r.get("brand") or "").strip()
         try:
+            cat = (r.get("categoria") or "").strip()
+            br  = (r.get("brand") or "").strip()
             if cat:
                 cid = find_or_create_collection(api_key, site_id, cat)
                 add_product_to_collection(api_key, site_id, cid, pid)
@@ -251,7 +274,8 @@ def main():
 
     with open("created_products.json", "w", encoding="utf-8") as f:
         json.dump({"created": created}, f, ensure_ascii=False, indent=2)
-    if not created:
+
+    if not created and not dry:
         print("[ERRORE] Nessun prodotto creato.")
         sys.exit(2)
 
