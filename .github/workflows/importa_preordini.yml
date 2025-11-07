@@ -8,7 +8,7 @@ on:
         required: true
         default: "input/"
       csv_name:
-        description: "Nome file CSV (es. template_preordini_v5.csv)"
+        description: "Nome file CSV (es. template_preordini_v5.csv) — lascia vuoto per prendere l'ultimo in cartella"
         required: false
         default: ""
       csv_url:
@@ -19,13 +19,14 @@ on:
         description: "Incolla qui il contenuto CSV (alternativa)"
         required: false
         default: ""
+      site_id_override:
+        description: "Site ID (facoltativo). Se vuoto lo rileviamo automaticamente o usiamo il secret WIX_SITE_ID"
+        required: false
+        default: ""
       dry_run:
-        description: "1 = non creare, solo simulazione e artifact"
+        description: "1 = simulazione (non crea su Wix), 0 = crea"
         required: false
         default: "0"
-  push:
-    paths:
-      - "input/*.csv"
 
 jobs:
   import:
@@ -88,19 +89,40 @@ jobs:
           echo "csv=$path" >> $GITHUB_OUTPUT
           echo "source=dir+name" >> $GITHUB_OUTPUT
 
-      - name: Trova Site ID dal dominio (auto)
+      - name: Risolvi Site ID (auto → secret → input)
         id: wixsite
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          SITE_ID_INPUT: ${{ github.event.inputs.site_id_override }}
+          SITE_ID_SECRET: ${{ secrets.WIX_SITE_ID }}
           TARGET_DOMAIN: "collezionismopertutti.com"
         run: |
           set -e
-          echo "Leggo i siti dall'account..."
-          curl -s -X GET "https://www.wixapis.com/sites/v1/sites" \
+          # 1) Se l'utente ha passato un Site ID a mano, usa quello
+          if [ -n "$SITE_ID_INPUT" ]; then
+            echo "site_id=$SITE_ID_INPUT" >> $GITHUB_OUTPUT
+            echo "Usando site_id da input."
+            exit 0
+          fi
+
+          # 2) Se esiste un secret WIX_SITE_ID, usalo
+          if [ -n "$SITE_ID_SECRET" ]; then
+            echo "site_id=$SITE_ID_SECRET" >> $GITHUB_OUTPUT
+            echo "Usando site_id da secret."
+            exit 0
+          fi
+
+          # 3) Autodetect via Sites API
+          echo "Autodetect Site ID via sites/v1/sites ..."
+          code=$(curl -s -o /tmp/sites.json -w "%{http_code}" \
+            -X GET "https://www.wixapis.com/sites/v1/sites" \
             -H "Authorization: $WIX_API_KEY" \
-            -H "Content-Type: application/json" > /tmp/sites.json || true
-          echo "Risposta sites/v1/sites (prime 800c):"
-          head -c 800 /tmp/sites.json || true; echo
+            -H "Content-Type: application/json")
+          echo "HTTP $code (sites list)"; head -c 800 /tmp/sites.json || true; echo
+          if [ "$code" -ge 300 ]; then
+            echo "Impossibile leggere i siti con questa chiave. Aggiungi il secret WIX_SITE_ID o passa site_id_override." >&2
+            exit 1
+          fi
 
           python - <<'PY'
 import os, json, sys
@@ -135,7 +157,7 @@ PY
             WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
         run: |
           set -e
-          echo "Provo POST /stores/v1/products/query con il Site ID trovato"
+          echo "Provo POST /stores/v1/products/query"
           code=$(curl -s -o /tmp/out.json -w "%{http_code}" \
             -X POST "https://www.wixapis.com/stores/v1/products/query" \
             -H "Authorization: $WIX_API_KEY" \
@@ -158,6 +180,7 @@ PY
         if: always()
         run: |
           echo "CSV usato: ${{ steps.prep.outputs.csv }} (source=${{ steps.prep.outputs.source }})"
+          echo "Site ID: ${{ steps.wixsite.outputs.site_id }}"
           echo "--- created_products.json ---"
           test -f created_products.json && cat created_products.json || echo "Nessun file di riepilogo trovato"
           echo "--- artifacts/ ---"
