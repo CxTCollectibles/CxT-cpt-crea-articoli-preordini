@@ -1,8 +1,18 @@
 name: Importa Preordini su Wix
 on:
   workflow_dispatch:
+    inputs:
+      csv_dir:
+        description: "Cartella nel repo"
+        required: true
+        default: "input/"
+      csv_name:
+        description: "Nome CSV (lascia vuoto per usare l'ultimo in cartella)"
+        required: false
+        default: ""
 jobs:
-  smoke:
+  echo:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Workflow riconosciuto"
+      - run: |
+          echo "OK: ${{ github.event.inputs.csv_dir }} ${{ github.event.inputs.csv_name }}"
