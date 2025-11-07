@@ -35,12 +35,16 @@ def read_rows(csv_path):
             class _D: delimiter = ","
             dialect = _D()
         reader = csv.DictReader(f, dialect=dialect)
+        count = 0
         for i,row in enumerate(reader, start=2):
             row = {k:v for k,v in row.items() if not str(k).startswith("__")}
             norm = {k.strip().lower(): (v or "").strip() for k,v in row.items()}
             if not (norm.get("nome_articolo") or norm.get("prezzo_eur") or norm.get("url_produttore")):
                 continue
+            count += 1
             yield i, norm
+        if count == 0:
+            print("[WARN] Nessuna riga valida trovata nel CSV.")
 
 def fetch_from_page(url):
     out = {"images":[], "sku":None, "ean":None, "weight_kg":None, "description":None}
@@ -132,6 +136,7 @@ def main():
         print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come secrets/env.")
         sys.exit(1)
 
+    created = []
     for rownum, r in read_rows(args.csv):
         name = r.get("nome_articolo")
         try:
@@ -157,7 +162,6 @@ def main():
         sku = sku or scraped.get("sku")
 
         dep, full = compute_prices(price) if is_preorder else (None, None)
-        # FIX: inline-if completo
         slug = f"{slugify(name)}-{sku.lower()}" if sku else slugify(name)
 
         product = {
@@ -193,7 +197,11 @@ def main():
         try:
             res = wix_request("POST","https://www.wixapis.com/stores/v1/products", api_key, site_id, {"product": product})
             pid = res.get("product",{}).get("id")
+            if not pid:
+                print(f"[ERRORE] Riga {rownum}: risposta senza product.id -> {json.dumps(res)[:300]}")
+                continue
             print(f"[OK] Riga {rownum} creato prodotto id={pid} :: {name}")
+            created.append({"row": rownum, "id": pid, "name": name, "slug": slug})
         except Exception as e:
             print(f"[ERRORE] Riga {rownum} '{name}': {e}")
             continue
@@ -207,5 +215,14 @@ def main():
             bid = find_or_create_collection(api_key, site_id, f"Brand: {br}")
             add_product_to_collection(api_key, site_id, bid, pid)
 
+    # Salva riepilogo creazioni
+    with open("created_products.json", "w", encoding="utf-8") as f:
+        json.dump({"created": created}, f, ensure_ascii=False, indent=2)
+
+    if not created:
+        print("[ERRORE] Nessun prodotto creato.")
+        sys.exit(2)
+
+# ---------- Entry ----------
 if __name__ == "__main__":
     main()
