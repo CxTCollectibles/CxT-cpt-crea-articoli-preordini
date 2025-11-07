@@ -1,19 +1,177 @@
 name: Importa Preordini su Wix
+
 on:
   workflow_dispatch:
     inputs:
       csv_dir:
-        description: "Cartella nel repo"
+        description: "Cartella nel repo (lascia input/)"
         required: true
         default: "input/"
       csv_name:
-        description: "Nome CSV (lascia vuoto per usare l'ultimo in cartella)"
+        description: "Nome file CSV (es. template_preordini_v5.csv) — lascia vuoto per usare l'ultimo in cartella"
         required: false
         default: ""
+      csv_url:
+        description: "URL pubblico del CSV (alternativa)"
+        required: false
+        default: ""
+      csv_inline:
+        description: "Incolla qui il contenuto CSV (alternativa)"
+        required: false
+        default: ""
+      site_id_override:
+        description: "Site ID (facoltativo). Se vuoto lo rileviamo o usiamo il secret WIX_SITE_ID"
+        required: false
+        default: ""
+      dry_run:
+        description: "1 = simulazione (non crea su Wix), 0 = crea"
+        required: false
+        default: "0"
+
 jobs:
-  echo:
+  import:
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          echo "OK: ${{ github.event.inputs.csv_dir }} ${{ github.event.inputs.csv_name }}"
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (pip + jq)
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Debug repo tree
+        run: |
+          echo "Contenuto repo:"; ls -la
+          echo "Contenuto input/:"; ls -la input || true
+
+      - name: Prepare CSV
+        id: prep
+        shell: bash
+        run: |
+          set -e
+          mkdir -p input
+          if [ -n "${{ github.event.inputs.csv_inline }}" ]; then
+            printf "%s" "${{ github.event.inputs.csv_inline }}" > input/inline.csv
+            echo "csv=input/inline.csv" >> "$GITHUB_OUTPUT"
+            echo "source=inline" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "${{ github.event.inputs.csv_url }}" ]; then
+            curl -L --fail --retry 3 --connect-timeout 15 "${{ github.event.inputs.csv_url }}" -o input/from_url.csv
+            echo "csv=input/from_url.csv" >> "$GITHUB_OUTPUT"
+            echo "source=url" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dir="${{ github.event.inputs.csv_dir }}"
+          name="${{ github.event.inputs.csv_name }}"
+          if [ -z "$name" ]; then
+            latest=$(ls -t "$dir"/*.csv 2>/dev/null | head -n1 || true)
+            if [ -z "$latest" ]; then
+              echo "Nessun CSV in $dir e nessun input alternativo." >&2
+              exit 1
+            fi
+            echo "csv=$latest" >> "$GITHUB_OUTPUT"
+            echo "source=latest_in_dir" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$name" != *.csv ]] && name="${name}.csv"
+          path="${dir%/}/$name"
+          if [ ! -f "$path" ]; then
+            echo "File non trovato: $path" >&2
+            exit 1
+          fi
+          echo "csv=$path" >> "$GITHUB_OUTPUT"
+          echo "source=dir+name" >> "$GITHUB_OUTPUT"
+
+      - name: Risolvi Site ID (ordine: input → secret → autodetect)
+        id: wixsite
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          SITE_ID_INPUT: ${{ github.event.inputs.site_id_override }}
+          SITE_ID_SECRET: ${{ secrets.WIX_SITE_ID }}
+          TARGET_DOMAIN: "collezionismopertutti.com"
+        run: |
+          set -e
+          if [ -n "$SITE_ID_INPUT" ]; then
+            echo "site_id=$SITE_ID_INPUT" >> "$GITHUB_OUTPUT"
+            echo "Usando site_id da input."
+            exit 0
+          fi
+          if [ -n "$SITE_ID_SECRET" ]; then
+            echo "site_id=$SITE_ID_SECRET" >> "$GITHUB_OUTPUT"
+            echo "Usando site_id da secret."
+            exit 0
+          fi
+          echo "Autodetect Site ID via sites/v1/sites ..."
+          curl -sS -X GET "https://www.wixapis.com/sites/v1/sites" \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "Content-Type: application/json" > /tmp/sites.json
+          DOMAIN="$TARGET_DOMAIN"
+          SITE_ID=$(jq -r --arg dom "$DOMAIN" '
+            (.sites // [])[]
+            | {id, dom: ((.primaryDomain.url // .domain // "") | ascii_downcase)}
+            | select(.dom | contains($dom))
+            | .id' /tmp/sites.json | head -n1)
+          if [ -z "$SITE_ID" ]; then
+            SITE_ID=$(jq -r '(.sites // [])[0].id // empty' /tmp/sites.json)
+          fi
+          if [ -z "$SITE_ID" ]; then
+            echo "Impossibile determinare Site ID. Risposta:" >&2
+            head -c 800 /tmp/sites.json || true; echo
+            exit 1
+          fi
+          echo "site_id=$SITE_ID" >> "$GITHUB_OUTPUT"
+          echo "Site ID rilevato: $SITE_ID"
+
+      - name: Test credenziali Wix (query prodotti)
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
+        run: |
+          set -e
+          echo "Provo POST /stores/v1/products/query"
+          code=$(curl -s -o /tmp/out.json -w "%{http_code}" \
+            -X POST "https://www.wixapis.com/stores/v1/products/query" \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "wix-site-id: $WIX_SITE_ID" \
+            -d '{"query":{}}')
+          echo "HTTP $code"
+          head -c 800 /tmp/out.json || true; echo
+          if [ "$code" -ge 300 ]; then exit 1; fi
+
+      - name: Run importer
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          python wix_preorder_ingestion.py --csv "${{ steps.prep.outputs.csv }}"
+
+      - name: Riepilogo
+        if: always()
+        run: |
+          echo "CSV usato: ${{ steps.prep.outputs.csv }} (source=${{ steps.prep.outputs.source }})"
+          echo "Site ID: ${{ steps.wixsite.outputs.site_id }}"
+          echo "--- created_products.json ---"
+          test -f created_products.json && cat created_products.json || echo "Nessun file di riepilogo trovato"
+          echo "--- artifacts/ ---"
+          ls -la artifacts || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wix-run-artifacts
+          path: |
+            artifacts
+            created_products.json
+          if-no-files-found: warn
