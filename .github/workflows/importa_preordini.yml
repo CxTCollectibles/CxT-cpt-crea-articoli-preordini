@@ -8,7 +8,7 @@ on:
         required: true
         default: "input/"
       csv_name:
-        description: "Nome file CSV (es. template_preordini_v5.csv) — lascia vuoto per prendere l'ultimo in cartella"
+        description: "Nome file CSV (es. template_preordini_v5.csv) — lascia vuoto per usare l'ultimo in cartella"
         required: false
         default: ""
       csv_url:
@@ -20,7 +20,7 @@ on:
         required: false
         default: ""
       site_id_override:
-        description: "Site ID (facoltativo). Se vuoto lo rileviamo automaticamente o usiamo il secret WIX_SITE_ID"
+        description: "Site ID (facoltativo). Se vuoto lo rileviamo o usiamo il secret WIX_SITE_ID"
         required: false
         default: ""
       dry_run:
@@ -98,21 +98,16 @@ jobs:
           TARGET_DOMAIN: "collezionismopertutti.com"
         run: |
           set -e
-          # 1) Se l'utente ha passato un Site ID a mano, usa quello
           if [ -n "$SITE_ID_INPUT" ]; then
             echo "site_id=$SITE_ID_INPUT" >> $GITHUB_OUTPUT
             echo "Usando site_id da input."
             exit 0
           fi
-
-          # 2) Se esiste un secret WIX_SITE_ID, usalo
           if [ -n "$SITE_ID_SECRET" ]; then
             echo "site_id=$SITE_ID_SECRET" >> $GITHUB_OUTPUT
             echo "Usando site_id da secret."
             exit 0
           fi
-
-          # 3) Autodetect via Sites API
           echo "Autodetect Site ID via sites/v1/sites ..."
           code=$(curl -s -o /tmp/sites.json -w "%{http_code}" \
             -X GET "https://www.wixapis.com/sites/v1/sites" \
@@ -120,10 +115,9 @@ jobs:
             -H "Content-Type: application/json")
           echo "HTTP $code (sites list)"; head -c 800 /tmp/sites.json || true; echo
           if [ "$code" -ge 300 ]; then
-            echo "Impossibile leggere i siti con questa chiave. Aggiungi il secret WIX_SITE_ID o passa site_id_override." >&2
+            echo "Impossibile leggere i siti: aggiungi il secret WIX_SITE_ID o passa site_id_override." >&2
             exit 1
           fi
-
           python - <<'PY'
 import os, json, sys
 p="/tmp/sites.json"
@@ -153,8 +147,8 @@ PY
 
       - name: Test credenziali Wix (query prodotti)
         env:
-            WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-            WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
         run: |
           set -e
           echo "Provo POST /stores/v1/products/query"
