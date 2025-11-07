@@ -95,88 +95,83 @@ def fetch_from_page(url):
 
 def wix_request(method, url, api_key, site_id, payload=None):
     headers = {"Content-Type":"application/json", "Authorization": api_key, "wix-site-id": site_id}
-    r = requests.request(method, url, headers=headers, data=(json.dumps(payload) if payload else None), timeout=30)
+    # Ripulisce None/"" nelle strutture complesse
+    payload = prune(payload)
+    r = requests.request(method, url, headers=headers, data=(json.dumps(payload) if payload is not None else None), timeout=30)
     if r.status_code >= 300:
-        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:800]}")
     return r.json()
 
-# ---------- Creator: prova V3 e fallback V1 ----------
-def create_product_dual(api_key, site_id, p, is_preorder, peso):
-    # Payload stile V3
-    p_v3 = {
-        "product": {
-            "name": p["name"],
-            "slug": p["slug"],
-            "visible": True,
-            "productType": "physical",
-            "description": p.get("description") or "",
-            "media": {"items": [{"src": u} for u in (p.get("images") or [])[:10]]},
-        }
+def prune(x):
+    # rimuove None, dict/list vuoti e chiavi con stringhe vuote dove proibitive
+    if isinstance(x, dict):
+        out = {}
+        for k,v in x.items():
+            pv = prune(v)
+            if pv is None: 
+                continue
+            if pv == "" and k in {"sku","description"}:
+                # description la vogliamo non-vuota solo dove serve
+                continue
+            if pv == {} or pv == []:
+                continue
+            out[k] = pv
+        return out
+    if isinstance(x, list):
+        out = [prune(v) for v in x]
+        out = [v for v in out if v not in (None,{},[],"")]
+        return out
+    return x
+
+# ---------- Creator: Catalog V3 pulito ----------
+def create_product_v3(api_key, site_id, base, is_preorder, peso):
+    product = {
+        "name": base["name"],
+        "slug": base["slug"],
+        "visible": True,
+        "productType": "physical",
+        "description": base.get("description") or base["name"],
+        # Anche se abbiamo varianti, alcuni tenant pretendono priceData a livello prodotto
+        "priceData": {"price": base["price"]},
+        "media": {"items": [{"src": u} for u in (base.get("images") or [])[:10]]},
     }
+    if peso is not None:
+        product["physicalProperties"] = {"weight": peso}
+
     if is_preorder:
-        p_v3["product"]["ribbon"] = "PREORDER"
-        p_v3["product"]["productOptions"] = [{
+        dep, full = compute_prices(base["price"])
+        product["ribbon"] = "PREORDER"
+        product["productOptions"] = [{
             "name": "PREORDER PAYMENTS OPTIONS",
-            "choices": [{"value":"ANTICIPO/SALDO"}, {"value":"PAGAMENTO ANTICIPATO"}]
+            "choices": [
+                {"value":"ANTICIPO/SALDO", "description":"Pagamento con acconto 30% e saldo alla consegna"},
+                {"value":"PAGAMENTO ANTICIPATO", "description":"Pagamento anticipato con sconto 5%"}
+            ]
         }]
-        # Varianti con priceData
-        dep, full = compute_prices(p["price"])
-        p_v3["product"]["variants"] = [
-            {"choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"}, "priceData":{"price": dep},  "sku": f"{p['sku']}-DEP" if p.get("sku") else None, "physicalProperties":{"weight": peso} if peso is not None else None},
-            {"choices":{"PREORDER PAYMENTS OPTIONS":"PAGAMENTO ANTICIPATO"}, "priceData":{"price": full}, "sku": f"{p['sku']}-FULL" if p.get("sku") else None, "physicalProperties":{"weight": peso} if peso is not None else None}
+        product["variants"] = [
+            {
+                "choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"},
+                "priceData":{"price": dep},
+                **({"sku": f"{base['sku']}-DEP"} if base.get("sku") else {}),
+                **({"physicalProperties":{"weight": peso}} if peso is not None else {})
+            },
+            {
+                "choices":{"PREORDER PAYMENTS OPTIONS":"PAGAMENTO ANTICIPATO"},
+                "priceData":{"price": full},
+                **({"sku": f"{base['sku']}-FULL"} if base.get("sku") else {}),
+                **({"physicalProperties":{"weight": peso}} if peso is not None else {})
+            }
         ]
-    else:
-        p_v3["product"]["priceData"] = {"price": p["price"]}
-        if peso is not None:
-            p_v3["product"]["physicalProperties"] = {"weight": peso}
 
-    # Prova V3
-    try:
-        res = wix_request("POST", "https://www.wixapis.com/stores/v3/products", api_key, site_id, p_v3)
-        pid = res.get("product",{}).get("id")
-        if pid:
-            print("[INFO] Creato via Catalog V3")
-            return pid, res
-        else:
-            print("[WARN] V3 senza product.id, provo V1… ->", str(res)[:200])
-    except Exception as e:
-        print("[WARN] V3 fallita, provo V1…", e)
-
-    # Payload stile V1 (minimal-compat)
-    p_v1 = {
-        "product": {
-            "name": p["name"],
-            "slug": p["slug"],
-            "visible": True,
-            "description": p.get("description") or "",
-            "mediaItems": [{"src": u} for u in (p.get("images") or [])[:10]],
-        }
-    }
-    if is_preorder:
-        dep, full = compute_prices(p["price"])
-        p_v1["product"]["ribbons"] = [{"text":"PREORDER"}]
-        p_v1["product"]["productOptions"] = [{
-            "name": "PREORDER PAYMENTS OPTIONS",
-            "choices": [{"value":"ANTICIPO/SALDO"}, {"value":"PAGAMENTO ANTICIPATO"}]
-        }]
-        p_v1["product"]["manageVariants"] = True
-        p_v1["product"]["variants"] = [
-            {"choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"}, "price": dep,  "sku": f"{p['sku']}-DEP" if p.get("sku") else None, "weight": peso},
-            {"choices":{"PREORDER PAYMENTS OPTIONS":"PAGAMENTO ANTICIPATO"}, "price": full, "sku": f"{p['sku']}-FULL" if p.get("sku") else None, "weight": peso}
-        ]
-    else:
-        p_v1["product"]["price"] = p["price"]
-        if p.get("sku"): p_v1["product"]["sku"] = p["sku"]
-        if peso is not None: p_v1["product"]["weight"] = peso
-
-    res = wix_request("POST", "https://www.wixapis.com/stores/v1/products", api_key, site_id, p_v1)
+    payload = {"product": product}
+    res = wix_request("POST", "https://www.wixapis.com/stores/v3/products", api_key, site_id, payload)
     pid = res.get("product",{}).get("id")
     if not pid:
-        raise RuntimeError(f"V1 senza product.id -> {str(res)[:300]}")
-    print("[INFO] Creato via Catalog V1")
+        raise RuntimeError(f"V3 risposta senza product.id -> {json.dumps(res)[:300]}")
+    print("[INFO] Creato via Catalog V3")
     return pid, res
 
-# ---------- Collezioni ----------
+# ---------- Collezioni (V1) ----------
 def find_or_create_collection(api_key, site_id, name):
     try:
         res = wix_request("POST","https://www.wixapis.com/stores/v1/collections/query", api_key, site_id,
@@ -226,7 +221,6 @@ def main():
             print(f"[ERRORE] Riga {rownum}: url_produttore non valido"); continue
 
         sku  = r.get("sku") or None
-        ean  = r.get("gtin_ean") or None  # non usato nel payload per evitare errori schema
         peso = to_float(r.get("peso_kg"))
         descr= r.get("descrizione") or ""
         tipo = (r.get("tipo_articolo") or "PREORDER").upper()
@@ -248,7 +242,7 @@ def main():
         }
 
         try:
-            pid, raw = create_product_dual(api_key, site_id, base, is_preorder, peso)
+            pid, raw = create_product_v3(api_key, site_id, base, is_preorder, peso)
             print(f"[OK] Riga {rownum} creato prodotto id={pid} :: {name}")
             created.append({"row": rownum, "id": pid, "name": name, "slug": base["slug"]})
         except Exception as e:
@@ -265,10 +259,9 @@ def main():
             bid = find_or_create_collection(api_key, site_id, f"Brand: {br}")
             add_product_to_collection(api_key, site_id, bid, pid)
 
-    # Salva riepilogo creazioni
+    # Riepilogo
     with open("created_products.json", "w", encoding="utf-8") as f:
         json.dump({"created": created}, f, ensure_ascii=False, indent=2)
-
     if not created:
         print("[ERRORE] Nessun prodotto creato.")
         sys.exit(2)
