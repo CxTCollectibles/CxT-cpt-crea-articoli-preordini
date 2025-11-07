@@ -1,0 +1,58 @@
+name: Importa Preordini su Wix (MANUALE)
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Percorso CSV nel repo (es. input/template_preordini_v5.csv)"
+        required: true
+        default: "input/template_preordini_v5.csv"
+      dry_run:
+        description: "1 = simulazione (non crea su Wix), 0 = crea davvero"
+        required: false
+        default: "0"
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run importer (skip precheck lettura)
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}   # deve essere il metaSiteId
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          SKIP_PRECHECK: "1"
+        run: |
+          python wix_preorder_ingestion.py --csv "${{ github.event.inputs.csv_path }}"
+
+      - name: Riepilogo & artifact
+        if: always()
+        run: |
+          echo "--- created_products.json ---"
+          test -f created_products.json && cat created_products.json || echo "Nessun file di riepilogo"
+          echo "--- artifacts/ ---"
+          ls -la artifacts || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wix-run-artifacts
+          path: |
+            artifacts
+            created_products.json
+          if-no-files-found: warn
