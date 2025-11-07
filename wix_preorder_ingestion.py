@@ -5,7 +5,6 @@ from bs4 import BeautifulSoup
 ARTDIR = "artifacts"
 os.makedirs(ARTDIR, exist_ok=True)
 
-# ---------- Utilità ----------
 def slugify(s):
     import unicodedata, re
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
@@ -69,7 +68,6 @@ def fetch_from_page(url):
         r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
-        # Description
         for sel in [".product-description", "#description", ".description", "article", ".product-single__description"]:
             node = soup.select_one(sel)
             if node and node.get_text(strip=True) and len(node.get_text(strip=True))>60:
@@ -77,7 +75,6 @@ def fetch_from_page(url):
         if not out["description"]:
             md = soup.select_one('meta[name="description"]')
             if md and md.get("content"): out["description"] = md.get("content")
-        # Images
         for tag in soup.select('meta[property="og:image"], meta[name="og:image"]'):
             c = tag.get("content")
             if c and c.startswith("http") and c not in out["images"]: out["images"].append(c)
@@ -85,7 +82,6 @@ def fetch_from_page(url):
             src = img.get("src") or img.get("data-src") or ""
             if src.startswith("//"): src = "https:"+src
             if src.startswith("http") and src not in out["images"]: out["images"].append(src)
-        # Text search
         text = soup.get_text("\n", strip=True)
         m = re.search(r"\b(\d{8,14})\b", text);  out["ean"] = out["ean"] or (m.group(1) if m else None)
         for pat in [r"SKU[:\s]+([A-Z0-9\-\._/]+)", r"Cod(?:ice)?\s*[:\s]+([A-Z0-9\-\._/]+)"]:
@@ -107,7 +103,6 @@ def wix_request(method, url, api_key, site_id, payload=None):
         raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:1200]}")
     return r.json()
 
-# Pre-check credenziali/tenant
 def precheck(api_key, site_id):
     try:
         res = wix_request("POST", "https://www.wixapis.com/stores/v1/products/query", api_key, site_id, {"query":{}})
@@ -118,7 +113,6 @@ def precheck(api_key, site_id):
         print(f"[PRECHECK] FALLITO: {e}")
         return False
 
-# API V1
 def create_product_v1(api_key, site_id, product):
     return wix_request("POST", "https://www.wixapis.com/stores/v1/products", api_key, site_id, {"product": product})
 
@@ -155,7 +149,6 @@ def add_product_to_collection(api_key, site_id, col_id, product_id):
     except Exception as e:
         print(f"[WARN] Add to collection: {e}")
 
-# ---------- Main ----------
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--csv", required=True)
@@ -164,16 +157,21 @@ def main():
     api_key = os.getenv("WIX_API_KEY","").strip()
     site_id = os.getenv("WIX_SITE_ID","").strip()
     dry = os.getenv("DRY_RUN","0").strip() == "1"
+    skip_pre = os.getenv("SKIP_PRECHECK","0").strip() == "1"
 
     if not api_key or not site_id:
-        print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come env (WIX_SITE_ID lo passa il workflow).")
+        print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come env.")
         sys.exit(1)
 
-    if not precheck(api_key, site_id):
-        sys.exit(3)
+    if not skip_pre:
+        if not precheck(api_key, site_id):
+            print("[INFO] Precheck fallito. Interrompo per evitare sorprese.")
+            sys.exit(3)
+    else:
+        print("[INFO] SKIP_PRECHECK=1: salto il test di lettura e provo direttamente a creare.")
 
     created = []
-    with open(args.csv, "rb") as _f: pass  # fail-fast
+    with open(args.csv, "rb") as _f: pass
 
     for rownum, r in read_rows(args.csv):
         name = r.get("nome_articolo")
@@ -181,7 +179,6 @@ def main():
             price = float((r.get("prezzo_eur") or "0").replace(",",".")); assert price>0
         except:
             print(f"[ERRORE] Riga {rownum}: prezzo non valido"); continue
-
         urlp = r.get("url_produttore")
         if not re.match(r"^https?://", urlp or ""):
             print(f"[ERRORE] Riga {rownum}: url_produttore non valido"); continue
@@ -200,11 +197,13 @@ def main():
 
         slug = f"{slugify(name)}-{sku.lower()}" if sku else slugify(name)
 
+        # >>>>>>>>>>>>> CAMBIO CHIAVE QUI: productType esplicito <<<<<<<<<<<<<<
         product = {
             "name": name,
             "slug": slug,
             "visible": True,
             "description": descr,
+            "productType": "physical",           # <-- obbligatorio in V1
             "priceData": {"price": price}
         }
 
@@ -229,13 +228,11 @@ def main():
                  **({"weight": peso} if peso is not None else {})}
             ]
 
-        # payload su file
-        pay_path = os.path.join(ARTDIR, f"payload_row_{rownum}.json")
-        with open(pay_path, "w", encoding="utf-8") as f:
+        with open(os.path.join(ARTDIR, f"payload_row_{rownum}.json"), "w", encoding="utf-8") as f:
             json.dump({"product": product}, f, ensure_ascii=False, indent=2)
 
         if dry:
-            print(f"[DRY-RUN] Riga {rownum}: simulazione, payload in {pay_path}")
+            print(f"[DRY-RUN] Riga {rownum}: simulazione, nessuna creazione.")
             continue
 
         try:
