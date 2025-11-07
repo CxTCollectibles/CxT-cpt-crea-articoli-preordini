@@ -134,8 +134,11 @@ def main():
 
     for rownum, r in read_rows(args.csv):
         name = r.get("nome_articolo")
-        try: price = float((r.get("prezzo_eur") or "0").replace(",",".")); assert price>0
-        except: print(f"[ERRORE] Riga {rownum}: prezzo non valido"); continue
+        try:
+            price = float((r.get("prezzo_eur") or "0").replace(",",".")); assert price>0
+        except:
+            print(f"[ERRORE] Riga {rownum}: prezzo non valido"); continue
+
         urlp = r.get("url_produttore")
         if not re.match(r"^https?://", urlp or ""):
             print(f"[ERRORE] Riga {rownum}: url_produttore non valido"); continue
@@ -154,4 +157,55 @@ def main():
         sku = sku or scraped.get("sku")
 
         dep, full = compute_prices(price) if is_preorder else (None, None)
-        slug = f"{slugify(name)}-{sku.lower()}" if sk
+        # FIX: inline-if completo
+        slug = f"{slugify(name)}-{sku.lower()}" if sku else slugify(name)
+
+        product = {
+            "name": name,
+            "slug": slug,
+            "visible": True,
+            "description": descr,
+            "price": price,
+            "inventory": {"trackQuantity": False},
+            "manageVariants": bool(is_preorder),
+            "ribbon": "PREORDER" if is_preorder else "",
+            "mediaItems": [{"src": u} for u in (scraped.get("images") or [])[:10]]
+        }
+        if is_preorder:
+            product["productOptions"] = [{
+                "name":"PREORDER PAYMENTS OPTIONS",
+                "choices":[{"value":"ANTICIPO/SALDO"},{"value":"PAGAMENTO ANTICIPATO"}]
+            }]
+            product["variants"] = [
+                {"choices":{"PREORDER PAYMENTS OPTIONS":"ANTICIPO/SALDO"}, "price": dep,  "sku": f"{sku}-DEP" if sku else None,  "weight": peso},
+                {"choices":{"PREORDER PAYMENTS OPTIONS":"PAGAMENTO ANTICIPATO"}, "price": full, "sku": f"{sku}-FULL" if sku else None, "weight": peso}
+            ]
+        else:
+            if peso is not None: product["weight"] = peso
+            product["productOptions"] = []
+            product["variants"] = []
+
+        custom = []
+        if ean: custom.append({"name":"EAN","value":ean})
+        if sku: custom.append({"name":"SKU","value":sku})
+        if custom: product["customTextFields"] = custom
+
+        try:
+            res = wix_request("POST","https://www.wixapis.com/stores/v1/products", api_key, site_id, {"product": product})
+            pid = res.get("product",{}).get("id")
+            print(f"[OK] Riga {rownum} creato prodotto id={pid} :: {name}")
+        except Exception as e:
+            print(f"[ERRORE] Riga {rownum} '{name}': {e}")
+            continue
+
+        cat = (r.get("categoria") or "").strip()
+        br  = (r.get("brand") or "").strip()
+        if cat:
+            cid = find_or_create_collection(api_key, site_id, cat)
+            add_product_to_collection(api_key, site_id, cid, pid)
+        if br:
+            bid = find_or_create_collection(api_key, site_id, f"Brand: {br}")
+            add_product_to_collection(api_key, site_id, bid, pid)
+
+if __name__ == "__main__":
+    main()
