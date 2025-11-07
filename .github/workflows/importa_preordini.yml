@@ -3,25 +3,26 @@ name: Importa Preordini su Wix
 on:
   workflow_dispatch:
     inputs:
-      # Opzione A: file nel repo (consigliata)
       csv_dir:
         description: "Cartella nel repo (lascia input/)"
         required: true
         default: "input/"
       csv_name:
-        description: "Nome del file CSV (es. template_preordini_v5.csv)"
+        description: "Nome file CSV (es. template_preordini_v5.csv)"
         required: false
         default: ""
-      # Opzione B: URL pubblico del CSV
       csv_url:
-        description: "URL pubblico del CSV (alternativa a csv_dir/csv_name)"
+        description: "URL pubblico del CSV (alternativa)"
         required: false
         default: ""
-      # Opzione C: incolla il contenuto del CSV
       csv_inline:
-        description: "Incolla qui il contenuto CSV (alternativa a csv_dir/csv_name)"
+        description: "Incolla qui il contenuto CSV (alternativa)"
         required: false
         default: ""
+      dry_run:
+        description: "1 = non creare, solo simulazione e artifact"
+        required: false
+        default: "0"
   push:
     paths:
       - "input/*.csv"
@@ -45,10 +46,8 @@ jobs:
 
       - name: Debug repo tree
         run: |
-          echo "Contenuto repo:"
-          ls -la
-          echo "Contenuto input/:"
-          ls -la input || true
+          echo "Contenuto repo:"; ls -la
+          echo "Contenuto input/:"; ls -la input || true
 
       - name: Prepare CSV
         id: prep
@@ -56,53 +55,102 @@ jobs:
         run: |
           set -e
           mkdir -p input
-
-          # 1) Contenuto incollato (priorità massima)
           if [ -n "${{ github.event.inputs.csv_inline }}" ]; then
             printf "%s" "${{ github.event.inputs.csv_inline }}" > input/inline.csv
             echo "csv=input/inline.csv" >> $GITHUB_OUTPUT
             echo "source=inline" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          # 2) URL pubblico
           if [ -n "${{ github.event.inputs.csv_url }}" ]; then
-            echo "Scarico CSV da URL..."
             curl -L --fail --retry 3 --connect-timeout 15 "${{ github.event.inputs.csv_url }}" -o input/from_url.csv
             echo "csv=input/from_url.csv" >> $GITHUB_OUTPUT
             echo "source=url" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          # 3) Percorso nel repo: csv_dir + csv_name (input/ è già preimpostato)
           dir="${{ github.event.inputs.csv_dir }}"
           name="${{ github.event.inputs.csv_name }}"
           if [ -z "$name" ]; then
             latest=$(ls -t "$dir"/*.csv 2>/dev/null | head -n1 || true)
             if [ -z "$latest" ]; then
-              echo "Nessun CSV trovato in $dir. Carica un file o usa csv_url/csv_inline." >&2
+              echo "Nessun CSV in $dir e nessun input alternativo." >&2
               exit 1
             fi
             echo "csv=$latest" >> $GITHUB_OUTPUT
             echo "source=latest_in_dir" >> $GITHUB_OUTPUT
             exit 0
           fi
-          if [[ "$name" != *.csv ]]; then
-            name="${name}.csv"
-          fi
+          [[ "$name" != *.csv ]] && name="${name}.csv"
           path="${dir%/}/$name"
           if [ ! -f "$path" ]; then
             echo "File non trovato: $path" >&2
-            echo "Suggerimento: carica il file in $dir o usa csv_inline/csv_url." >&2
             exit 1
           fi
           echo "csv=$path" >> $GITHUB_OUTPUT
           echo "source=dir+name" >> $GITHUB_OUTPUT
 
+      - name: Trova Site ID dal dominio (auto)
+        id: wixsite
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          TARGET_DOMAIN: "collezionismopertutti.com"
+        run: |
+          set -e
+          echo "Leggo i siti dall'account..."
+          curl -s -X GET "https://www.wixapis.com/sites/v1/sites" \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "Content-Type: application/json" > /tmp/sites.json || true
+          echo "Risposta sites/v1/sites (prime 800c):"
+          head -c 800 /tmp/sites.json || true; echo
+
+          python - <<'PY'
+import os, json, sys
+p="/tmp/sites.json"
+data=json.load(open(p)) if os.path.exists(p) else {}
+target=os.environ.get('TARGET_DOMAIN','').lower()
+site_id=''
+candidates=[]
+for s in data.get('sites',[]):
+    dom=(s.get('primaryDomain') or {}).get('url','') or (s.get('domain','') or '')
+    name=s.get('name','')
+    sid=s.get('id','')
+    if sid:
+        candidates.append((sid,name,dom))
+    if target and target in (dom or '').lower():
+        site_id=sid
+if not site_id and len(candidates)==1:
+    site_id=candidates[0][0]
+if not site_id:
+    print("Non trovato Site ID per il dominio. Siti disponibili:")
+    for sid,name,dom in candidates:
+        print(f"- {name} | id={sid} | dominio={dom}")
+    sys.exit(1)
+print(f"Site ID scelto: {site_id}")
+with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+    f.write(f"site_id={site_id}\n")
+PY
+
+      - name: Test credenziali Wix (query prodotti)
+        env:
+            WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+            WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
+        run: |
+          set -e
+          echo "Provo POST /stores/v1/products/query con il Site ID trovato"
+          code=$(curl -s -o /tmp/out.json -w "%{http_code}" \
+            -X POST "https://www.wixapis.com/stores/v1/products/query" \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "wix-site-id: $WIX_SITE_ID" \
+            -d '{"query":{}}')
+          echo "HTTP $code"
+          head -c 800 /tmp/out.json; echo
+          if [ "$code" -ge 300 ]; then exit 1; fi
+
       - name: Run importer
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+          WIX_SITE_ID: ${{ steps.wixsite.outputs.site_id }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           python wix_preorder_ingestion.py --csv "${{ steps.prep.outputs.csv }}"
 
@@ -112,11 +160,15 @@ jobs:
           echo "CSV usato: ${{ steps.prep.outputs.csv }} (source=${{ steps.prep.outputs.source }})"
           echo "--- created_products.json ---"
           test -f created_products.json && cat created_products.json || echo "Nessun file di riepilogo trovato"
+          echo "--- artifacts/ ---"
+          ls -la artifacts || true
 
-      - name: Upload artifact (prodotti creati)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: created_products
-          path: created_products.json
+          name: wix-run-artifacts
+          path: |
+            artifacts
+            created_products.json
           if-no-files-found: warn
