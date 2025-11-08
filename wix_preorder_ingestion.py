@@ -7,16 +7,16 @@ import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
-# --- Env ---
+# ===== Env =====
 WIX_API_KEY  = os.getenv("WIX_API_KEY", "").strip()
-WIX_SITE_ID  = os.getenv("WIX_SITE_ID", "").strip()  # metaSiteId
+WIX_SITE_ID  = os.getenv("WIX_SITE_ID", "").strip()   # metaSiteId (quello che ti ha dato 200)
 USER_AGENT   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
-# --- Endpoints ---
-STORES_V1      = "https://www.wixapis.com/stores/v1"
-CATEGORIES_V1  = "https://www.wixapis.com/categories/v1"
-COLLECTIONS_V1 = "https://www.wixapis.com/stores/v1/collections"
-MEDIA_V1       = "https://www.wixapis.com/site-media/v1"
+# ===== Endpoints =====
+STORES_V1       = "https://www.wixapis.com/stores/v1"
+CATEGORIES_V1   = "https://www.wixapis.com/categories/v1"
+COLLECTIONS_V1  = "https://www.wixapis.com/stores/v1/collections"
+MEDIA_V1        = "https://www.wixapis.com/site-media/v1"
 WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e"
 
 session = requests.Session()
@@ -33,7 +33,7 @@ def fail(msg, code=1):
 
 def http(method, url, **kw):
     for i in range(3):
-        r = session.request(method, url, timeout=45, **kw)
+        r = session.request(method, url, timeout=50, **kw)
         if r.status_code in (429,500,502,503,504):
             time.sleep(1.2*(i+1)); continue
         return r
@@ -74,18 +74,15 @@ def clean_imgs(imgs):
     for u in imgs:
         u0 = u.split("?")[0].lower()
         if not u0.endswith(IMG_EXT): continue
-        # non filtriamo più "thumb": alcuni siti usano quel path anche per le grandi
         if u in seen: continue
         seen.add(u); out.append(u)
-    return out[:20]
+    return out[:30]
 
 def pick_desc_block(soup):
-    # blocco centrale sotto il titolo (layout classico e come nello screenshot)
     selectors = [
-        "div.product-description", "div.product__description",
-        "div.product-info__description", "section.product-description",
-        "#product-description", "#description", ".description",
-        ".tab-content .active", ".tabs-content", "article"
+        "div.product-description","div.product__description","div.product-info__description",
+        "#product-description","#description",".description",
+        ".tab-content .active",".tabs-content","article"
     ]
     for sel in selectors:
         n = soup.select_one(sel)
@@ -94,16 +91,13 @@ def pick_desc_block(soup):
             txt = " ".join(p.get_text(" ", strip=True) for p in ps)
             if len(txt) > 120:
                 return "".join(str(p) for p in ps[:20])
-    # fallback: meta
     m = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", attrs={"property":"og:description"})
-    if m and m.get("content"):
-        return f"<p>{html.escape(m['content'])}</p>"
+    if m and m.get("content"): return f"<p>{html.escape(m['content'])}</p>"
     return ""
 
 ETA_PATTERNS = [
-    r"\bETA\s*:\s*([A-Z]+\.?\s*\d{1,2}/\d{4}|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2})",
-    r"\bETA\s*([A-Z]+\.?\s*\d{1,2}/\d{4}|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2})",
-    r"\bUscita prevista\s*:\s*([^\n<]{3,40})"
+    r"\bETA\s*:\s*([A-Z]+(?:\s*\d{1,2}/\d{4})?|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2})",
+    r"\bETA\s*([A-Z]+(?:\s*\d{1,2}/\d{4})?|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2})"
 ]
 DEAD_PATTERNS = [
     r"\bDeadline\s*:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})",
@@ -111,8 +105,8 @@ DEAD_PATTERNS = [
     r"\bChiusura\s*preordine\s*[:\-]?\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})"
 ]
 
-def extract_eta_deadline(full_text):
-    t = " ".join((full_text or "").split())
+def extract_eta_deadline(text):
+    t = " ".join((text or "").split())
     eta = None; dead = None
     for pat in ETA_PATTERNS:
         m = re.search(pat, t, re.I)
@@ -128,43 +122,51 @@ def extract_eta_deadline(full_text):
     return eta, dead
 
 def find_zip_link(url, soup):
+    # prova testo visibile
     for a in soup.find_all("a", href=True):
         txt = (a.get_text(" ", strip=True) or "").lower()
         if any(k in txt for k in ["scarica immagini","download images","bilder herunterladen"]):
+            return abs_urls(url, [a["href"]])[0]
+    # prova title/aria-label
+    for a in soup.select("a[href][title], a[href][aria-label]"):
+        t = ((a.get("title") or "") + " " + (a.get("aria-label") or "")).lower()
+        if any(k in t for k in ["scarica immagini","download images","bilder herunterladen"]):
             return abs_urls(url, [a["href"]])[0]
     return None
 
 def scrape_page(url):
     try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=35)
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=40)
         if r.status_code != 200:
-            return {"desc":"", "images":[], "full_text":""}
+            return {"desc":"", "images":[], "zip_url":None, "full_text":""}
     except:
-        return {"desc":"", "images":[], "full_text":""}
+        return {"desc":"", "images":[], "zip_url":None, "full_text":""}
 
     soup = BeautifulSoup(r.text, "lxml")
     desc_html = pick_desc_block(soup)
 
-    # immagini: 1) zip; 2) link <a href="*.jpg">; 3) og/img generici
     zip_url = find_zip_link(url, soup)
-    imgs = []
 
-    if not zip_url:
-        # link <a> diretti a immagini grandi
-        hrefs = [a["href"] for a in soup.select("a[href]") if any(a["href"].lower().split("?")[0].endswith(ext) for ext in IMG_EXT)]
-        imgs = clean_imgs(abs_urls(url, hrefs))
+    # immagini: <a href=*.jpg>, <img>, <source srcset>
+    img_urls = []
+    for a in soup.select("a[href]"):
+        href = a.get("href","")
+        if any(href.lower().split("?")[0].endswith(ext) for ext in IMG_EXT):
+            img_urls.append(href)
 
-    if not imgs and not zip_url:
-        cand=[]
-        og = soup.find("meta", attrs={"property":"og:image"})
-        if og and og.get("content"): cand.append(og["content"])
-        for im in soup.find_all("img"):
-            src = im.get("data-zoom-image") or im.get("data-large_image") or im.get("data-src") or im.get("src")
-            if src: cand.append(src)
-        imgs = clean_imgs(abs_urls(url, cand))
+    for im in soup.find_all("img"):
+        src = im.get("data-zoom-image") or im.get("data-large_image") or im.get("data-src") or im.get("src")
+        if src: img_urls.append(src)
 
+    for src in soup.select("source[srcset]"):
+        ss = src.get("srcset") or ""
+        for part in ss.split(","):
+            u = part.strip().split(" ")[0]
+            if u: img_urls.append(u)
+
+    img_urls = clean_imgs(abs_urls(url, img_urls))
     full_text = soup.get_text(" ", strip=True)
-    return {"desc":desc_html, "images":imgs, "zip_url":zip_url, "full_text": full_text}
+    return {"desc": desc_html, "images": img_urls, "zip_url": zip_url, "full_text": full_text}
 
 # ---------- Media ----------
 def media_bulk_import(urls, folder="media-root/preordini"):
@@ -184,7 +186,7 @@ def media_upload_bytes(name, content, folder="media-root/preordini"):
     headers = {k:v for k,v in session.headers.items() if k.lower()!="content-type"}
     files = {"file": (name, content, mimetypes.guess_type(name)[0] or "application/octet-stream")}
     data = {"filePath": folder, "displayName": name}
-    r = requests.post(f"{MEDIA_V1}/files/upload", headers=headers, files=files, data=data, timeout=90)
+    r = requests.post(f"{MEDIA_V1}/files/upload", headers=headers, files=files, data=data, timeout=120)
     if r.status_code != 200:
         print(f"[WARN] Upload {name} -> {r.status_code}: {r.text[:200]}")
         return None
@@ -198,11 +200,11 @@ def product_add_media(product_id, files):
     if r.status_code != 200:
         print(f"[WARN] Add media {r.status_code}: {r.text[:200]}")
 
-def import_images(scraped, page_url):
+def import_images(scraped):
     out=[]
     if scraped.get("zip_url"):
         try:
-            z = requests.get(scraped["zip_url"], headers={"User-Agent": USER_AGENT}, timeout=90)
+            z = requests.get(scraped["zip_url"], headers={"User-Agent": USER_AGENT}, timeout=120)
             z.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
                 names = [n for n in zf.namelist() if os.path.splitext(n.lower())[1] in IMG_EXT]
@@ -263,17 +265,17 @@ CHOICE_FULL    = "PAGAMENTO ANTICIPATO"
 
 def make_payload(row):
     # v6/v7 compat
-    name   = gf(row, "nome_articolo","Nome articolo")
-    price  = gf(row, "prezzo_eur","Prezzo")
-    url_d  = gf(row, "url_produttore","URL pagina distributore")
-    sku    = gf(row, "sku","SKU")
-    peso   = gf(row, "peso_kg","Peso (kg)")
-    brand  = gf(row, "brand","Brand","Brand (seleziona)")
-    cat    = gf(row, "categoria","Categoria","Categoria (seleziona)")
-    descr0 = gf(row, "descrizione","Descrizione override (opzionale)")
-    scad   = gf(row, "preorder_scadenza","Scadenza preordine (gg/mm/aaaa)")
-    eta    = gf(row, "eta","ETA (mm/aaaa o gg/mm/aaaa)")
-    imgs_x = gf(row, "immagini_urls","URL immagini extra (separate da |) [opzionale]")
+    name   = gf(row,"nome_articolo","Nome articolo")
+    price  = gf(row,"prezzo_eur","Prezzo")
+    url_d  = gf(row,"url_produttore","URL pagina distributore")
+    sku    = gf(row,"sku","SKU")
+    peso   = gf(row,"peso_kg","Peso (kg)")
+    brand  = gf(row,"brand","Brand","Brand (seleziona)")
+    cat    = gf(row,"categoria","Categoria","Categoria (seleziona)")
+    descr0 = gf(row,"descrizione","Descrizione override (opzionale)")
+    scad   = gf(row,"preorder_scadenza","Scadenza preordine (gg/mm/aaaa)")
+    eta    = gf(row,"eta","ETA (mm/aaaa o gg/mm/aaaa)")
+    imgs_x = gf(row,"immagini_urls","URL immagini extra (separate da |) [opzionale]")
 
     if not name or not price or not url_d:
         raise ValueError("mancano nome/prezzo/url_distributore")
@@ -282,7 +284,6 @@ def make_payload(row):
 
     # scrape pagina
     scraped = scrape_page(url_d)
-    # ETA/Deadline dal testo pagina (alto a destra)
     e2, d2 = extract_eta_deadline(scraped.get("full_text",""))
     eta = eta or e2
     scad = scad or d2
@@ -294,11 +295,11 @@ def make_payload(row):
     desc_html = (descr0 or scraped.get("desc") or "")
     description = (header + (desc_html or ""))[:7900]
 
-    # immagini finali (scrape + extra csv)
+    # immagini finali
     extra = [u.strip() for u in imgs_x.split("|")] if imgs_x else []
     scraped["images"] = (scraped.get("images") or []) + extra
 
-    # varianti: uso anche 'price' per forzare override
+    # varianti (forzo sia priceData.price che price)
     p_deposit = round(base_price * 0.30, 2)
     p_full    = round(base_price * 0.95, 2)
 
@@ -325,11 +326,23 @@ def make_payload(row):
             {"choices": {OPTION_NAME: CHOICE_FULL},    "price": p_full,    "priceData": {"price": p_full},    "sku": f"{sku}-PA" if sku else None}
         ]
     }
-    return product, scraped, cat, url_d
+    return product, scraped, cat
 
 def create_product(product):
     body = {"product": product}
     r = http("POST", f"{STORES_V1}/products", data=json.dumps(body))
+    return r
+
+def get_product(pid):
+    r = http("GET", f"{STORES_V1}/products/{pid}")
+    try:
+        return r.json().get("product", {})
+    except Exception:
+        return {}
+
+def patch_variants(pid, variants):
+    body = {"product": {"id": pid, "variants": variants}}
+    r = http("PATCH", f"{STORES_V1}/products/{pid}", data=json.dumps(body))
     return r
 
 def run(csv_path):
@@ -343,7 +356,7 @@ def run(csv_path):
     for line, row in rows:
         name = gf(row,"nome_articolo","Nome articolo") or "(senza nome)"
         try:
-            product, scraped, categoria, page_url = make_payload(row)
+            product, scraped, categoria = make_payload(row)
         except Exception as e:
             print(f"[ERRORE] Riga {line}: {e}"); continue
 
@@ -355,25 +368,53 @@ def run(csv_path):
         if not pid:
             print(f"[ERRORE] Riga {line}: prodotto creato ma senza id."); continue
 
-        # immagini (zip o url) + attach
+        # immagini (zip/url) + attach
         try:
-            files = import_images(scraped, page_url)
-            if files:
-                product_add_media(pid, files)
-            else:
-                print(f"[WARN] Riga {line} '{name}': nessuna immagine caricata (controlla permessi Media o layout pagina).")
+            files = import_images(scraped)
+            if files: product_add_media(pid, files)
+            else:     print(f"[WARN] Riga {line} '{name}': nessuna immagine caricata.")
         except Exception as e:
             print(f"[WARN] Immagini: {e}")
 
         # categoria / collection
         try:
-            if categoria:
-                add_to_category_or_collection(pid, categoria)
+            if categoria: add_to_category_or_collection(pid, categoria)
         except Exception as e:
             print(f"[WARN] Categoria/Collection: {e}")
 
-        v1 = product["variants"][0]["price"]; v2 = product["variants"][1]["price"]
-        print(f"[OK] Riga {line} creato '{name}' | Varianti: AS={v1}  PA={v2}")
+        # post-check varianti lette da Wix
+        stored = get_product(pid)
+        try:
+            sv = stored.get("variants", []) or []
+            sv_prices = [(v.get('choices'), v.get('priceData',{}).get('price'), v.get('price')) for v in sv]
+            print(f"[CHECK] Varianti salvate da Wix: {sv_prices}")
+            # se Wix ha messo il prezzo base, forzo un PATCH con i prezzi giusti
+            base = product["priceData"]["price"]
+            want = {
+                CHOICE_DEPOSIT: round(base*0.30,2),
+                CHOICE_FULL:    round(base*0.95,2)
+            }
+            needs_patch = False
+            patched = []
+            for v in sv:
+                choice_val = list((v.get("choices") or {}).values())[0]
+                target = want.get(choice_val)
+                if target is None:
+                    patched.append(v); continue
+                pv = v.get("priceData",{}).get("price")
+                p  = v.get("price")
+                if pv != target or p != target:
+                    v["priceData"] = {"price": target}
+                    v["price"] = target
+                    needs_patch = True
+                patched.append(v)
+            if needs_patch:
+                pr = patch_variants(pid, patched)
+                print(f"[CHECK] Patch varianti -> {pr.status_code}")
+        except Exception as e:
+            print(f"[WARN] Post-check varianti: {e}")
+
+        print(f"[OK] Riga {line} creato '{name}'")
         created += 1
 
     if created == 0:
@@ -381,10 +422,7 @@ def run(csv_path):
     print(f"[FINE] Prodotti creati: {created}")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True)
+    ap = argparse.ArgumentParser(); ap.add_argument("--csv", required=True)
     args = ap.parse_args()
-    if not os.path.exists(args.csv):
-        fail(f"File non trovato: {args.csv}")
+    if not os.path.exists(args.csv): fail(f"File non trovato: {args.csv}")
     run(args.csv)
-
