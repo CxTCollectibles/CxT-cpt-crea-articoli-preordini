@@ -13,9 +13,11 @@ WIX_SITE_ID  = os.getenv("WIX_SITE_ID", "").strip()  # metaSiteId
 USER_AGENT   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
 # --- Endpoint ---
-STORES_V1    = "https://www.wixapis.com/stores/v1"
-CATEGORIES_V1= "https://www.wixapis.com/categories/v1"
-MEDIA_V1     = "https://www.wixapis.com/site-media/v1"
+STORES_V1     = "https://www.wixapis.com/stores/v1"
+CATEGORIES_V1 = "https://www.wixapis.com/categories/v1"
+MEDIA_V1      = "https://www.wixapis.com/site-media/v1"
+
+# AppId Stores per categories bulk add
 WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e"
 
 session = requests.Session()
@@ -35,13 +37,13 @@ def http(method, url, **kw):
     for i in range(3):
         r = session.request(method, url, timeout=40, **kw)
         if r.status_code in (429,500,502,503,504):
-            time.sleep(1.5*(i+1)); continue
+            time.sleep(1.2*(i+1)); continue
         return r
     return r
 
 # ---------- CSV utils (supporto v6 e v7) ----------
-def sniff_reader(path):
-    with open(path, "r", encoding="utf-8-sig") as f:
+def detect_reader(path):
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
         sample = f.read(4096)
         f.seek(0)
         try:
@@ -49,7 +51,9 @@ def sniff_reader(path):
         except Exception:
             class _D: delimiter=";"
             dialect = _D()
-        return csv.DictReader(f, dialect=dialect)
+        reader = csv.DictReader(f, dialect=dialect)
+        rows = [(i, row) for i, row in enumerate(reader, start=2)]
+    return rows
 
 def gf(row, *keys):
     for k in keys:
@@ -57,16 +61,9 @@ def gf(row, *keys):
             return str(row[k]).strip()
     return ""
 
-def parse_csv(path):
-    rows = []
-    rdr = sniff_reader(path)
-    for i, r in enumerate(rdr, start=2):
-        rows.append((i, r))
-    return rows
-
 # ---------- Scraping descrizione + immagini ----------
 IMG_EXT = (".jpg",".jpeg",".png",".webp",".gif",".jfif")
-MONTHS  = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|gen(?:naio)?|feb(?:braio)?|mar(?:zo)?|apr(?:ile)?|mag(?:gio)?|giu(?:gno)?|lug(?:lio)?|ago(?:sto)?|set(?:tembre)?|ott(?:obre)?|nov(?:embre)?|dic(?:embre)?)"
+MONTHS  = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|gen(?:naio)?|feb(?:braio)?|mar(?:zo)?|apr(?:ile)?|mag(?:gio)?|giu(?:gno)?|lug(?:lio)?|ago(?:sto)?|set(?:tembre)?|ott(?:obre)?|nov(?:embre)?)"
 
 def abs_urls(base, urls):
     out=[]
@@ -96,7 +93,7 @@ def scrape_page(url):
         return None, []
     soup = BeautifulSoup(r.text, "lxml")
 
-    # Descrizione: cerca blocchi “sotto le foto”
+    # Descrizione: blocchi “sotto le foto”
     cands = []
     for sel in [
         ".product-description", "#description", ".description",
@@ -110,9 +107,11 @@ def scrape_page(url):
                 cands.append(n)
 
     if cands:
-        # prendo il blocco con più testo
+        # blocco con più testo
         cands.sort(key=lambda n: len(n.get_text()), reverse=True)
-        desc_html = "".join(str(p) for p in cands[0].find_all(["p","li"])[:12]) or str(cands[0])
+        # prendi i primi paragrafi o l'intero blocco
+        ps = [p for p in cands[0].find_all(["p","li"]) if p.get_text(strip=True)]
+        desc_html = "".join(str(p) for p in ps[:12]) or str(cands[0])
     else:
         # fallback meta
         meta = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", attrs={"property":"og:description"})
@@ -236,7 +235,8 @@ def make_payload(row):
 
     # scraping
     desc_html, imgs_scraped = scrape_page(url_d)
-    # prepend PREORDER line
+
+    # prepend PREORDER in testa alla descrizione se ho scadenza/eta
     header = ""
     if scad or eta:
         parts=[]
@@ -281,7 +281,7 @@ def make_payload(row):
     return product, image_urls, cat
 
 def create_product(product):
-    body = {"product": product}  # <-- wrapper obbligatorio per V1
+    body = {"product": product}  # wrapper obbligatorio
     r = http("POST", f"{STORES_V1}/products", data=json.dumps(body))
     return r
 
@@ -291,7 +291,7 @@ def run(csv_path):
     if t.status_code != 200:
         fail(f"[ERRORE] API non valide: {t.status_code} {t.text}")
 
-    rows = parse_csv(csv_path)
+    rows = detect_reader(csv_path)  # <-- FIX: leggo tutto con file aperto qui dentro
     created = 0
     for line, row in rows:
         try:
