@@ -7,12 +7,15 @@ import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
-# ========= ENV =========
+# NEW: Playwright per pagine JS (heo)
+from playwright.sync_api import sync_playwright
+
+# ===== Env =====
 WIX_API_KEY  = os.getenv("WIX_API_KEY", "").strip()
-WIX_SITE_ID  = os.getenv("WIX_SITE_ID", "").strip()   # metaSiteId
+WIX_SITE_ID  = os.getenv("WIX_SITE_ID", "").strip()   # metaSiteId (quello che ti risponde 200)
 USER_AGENT   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
-# ========= ENDPOINTS =========
+# ===== Endpoints =====
 STORES_V1       = "https://www.wixapis.com/stores/v1"
 CATEGORIES_V1   = "https://www.wixapis.com/categories/v1"
 COLLECTIONS_V1  = "https://www.wixapis.com/stores/v1/collections"
@@ -39,8 +42,9 @@ def http(method, url, **kw):
         return r
     return r
 
-# ========= CSV (v6/v7 compat) =========
+# ===== CSV =====
 def read_rows(path):
+    import csv
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         sample = f.read(4096); f.seek(0)
         try:
@@ -57,8 +61,37 @@ def gf(row, *keys):
             return str(row[k]).strip()
     return ""
 
-# ========= SCRAPING =========
+# ===== RENDER + SCRAPE (con Playwright) =====
 IMG_EXT = (".jpg",".jpeg",".png",".webp",".gif",".jfif")
+
+def rendered_page(url):
+    """Ritorna (html_rendered, zip_bytes_or_None) provando anche click su 'Scarica immagini'."""
+    html_rendered = ""
+    zip_bytes = None
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=USER_AGENT, accept_downloads=True)
+        page = ctx.new_page()
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        html_rendered = page.content()
+
+        # prova a catturare il download ZIP
+        try:
+            # varianti di testo
+            link_texts = ["Scarica immagini", "Download images", "Bilder herunterladen"]
+            for txt in link_texts:
+                els = page.locator(f"text={txt}")
+                if els.count() > 0:
+                    with page.expect_download(timeout=10000) as dl_info:
+                        els.first.click()
+                    dl = dl_info.value
+                    zip_bytes = dl.create_read_stream().read()
+                    break
+        except Exception:
+            pass
+
+        browser.close()
+    return html_rendered, zip_bytes
 
 def abs_urls(base, urls):
     base_root = "{u.scheme}://{u.netloc}".format(u=urlparse(base))
@@ -69,70 +102,37 @@ def abs_urls(base, urls):
         out.append(u if o.scheme in ("http","https") else urljoin(base_root, u))
     return out
 
-def head_is_image(u):
-    try:
-        r = requests.head(u, headers={"User-Agent": USER_AGENT}, allow_redirects=True, timeout=12)
-        ct = (r.headers.get("Content-Type") or "").lower()
-        return ct.startswith("image/")
-    except:  # se HEAD cade, prova GET light
-        try:
-            r = requests.get(u, headers={"User-Agent": USER_AGENT}, stream=True, timeout=12)
-            ct = (r.headers.get("Content-Type") or "").lower()
-            return ct.startswith("image/")
-        except:
-            return False
-
-def pick_image_candidates(soup):
-    cand = []
-    # <a href="*.jpg|png|..."> e anche link senza estensione (verifica dopo)
-    for a in soup.select("a[href]"):
-        cand.append(a["href"])
-    # <img src | data-*>
-    for im in soup.find_all("img"):
-        for attr in ("data-zoom-image","data-large_image","data-src","src","data-original"):
-            v = im.get(attr)
-            if v: cand.append(v)
-    # <source srcset>
-    for s in soup.select("source[srcset]"):
-        ss = s.get("srcset") or ""
-        for part in ss.split(","):
-            u = part.strip().split(" ")[0]
-            if u: cand.append(u)
-    return cand
-
 def keep_images(url, cand):
-    # mantieni: tutto ciò che è immagine per estensione O perché il server dice image/*
-    urls = abs_urls(url, [c for c in cand if c])
-    urls = list(dict.fromkeys(urls))  # dedup
-    good=[]
-    for u in urls:
+    # tiene anche URL senza estensione verificando HEAD/GET se image/*
+    out=[]
+    seen=set()
+    for u in abs_urls(url, cand):
+        if u in seen: continue
+        seen.add(u)
         u0 = u.split("?")[0].lower()
-        if u0.endswith(IMG_EXT) or head_is_image(u):
-            good.append(u)
-        if len(good) >= 20: break
-    return good
+        if any(u0.endswith(ext) for ext in IMG_EXT):
+            out.append(u); 
+        else:
+            try:
+                r = requests.head(u, headers={"User-Agent": USER_AGENT}, allow_redirects=True, timeout=10)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if ct.startswith("image/"): out.append(u)
+            except:
+                try:
+                    r = requests.get(u, headers={"User-Agent": USER_AGENT}, stream=True, timeout=10)
+                    ct = (r.headers.get("Content-Type") or "").lower()
+                    if ct.startswith("image/"): out.append(u)
+                except:
+                    pass
+        if len(out) >= 20: break
+    return out
 
-def find_zip_link(url, soup):
-    # link del tipo "Scarica immagini / Download images"
-    for a in soup.find_all("a", href=True):
-        txt = (a.get_text(" ", strip=True) or "").lower()
-        if any(k in txt for k in ["scarica immagini","download images","bilder herunterladen"]):
-            return abs_urls(url, [a["href"]])[0]
-    # anche via title/aria-label
-    for a in soup.select("a[href][title], a[href][aria-label]"):
-        t = ((a.get("title") or "") + " " + (a.get("aria-label") or "")).lower()
-        if any(k in t for k in ["scarica immagini","download images","bilder herunterladen"]):
-            return abs_urls(url, [a["href"]])[0]
-    return None
-
-def pick_desc_block(soup, selector_override=None):
+def parse_description(soup, selector_override=None):
     if selector_override:
         n = soup.select_one(selector_override)
         if n:
             ps = [p for p in n.find_all(["p","li","div"]) if p.get_text(strip=True)]
-            if ps:
-                return "".join(str(p) for p in ps[:20])
-            return str(n)
+            return "".join(str(p) for p in ps[:20]) or str(n)
 
     selectors = [
         "div.product-description","div.product__description","div.product-info__description",
@@ -151,8 +151,7 @@ def pick_desc_block(soup, selector_override=None):
     return ""
 
 ETA_PATTERNS = [
-    r"\bETA\s*:\s*([A-Z]+(?:\s*\d{1,2}/\d{4})?|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2})",
-    r"\bETA\s*([A-Z]+(?:\s*\d{1,2}/\d{4})?|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2})",
+    r"\bETA\s*:\s*([A-Z]+(?:\s*\d{1,2}/\d{4})?|[A-Z]+\s*\d{4}|Q[1-4](?:\s*-\s*Q[1-4])?\s*20\d{2}|FINE\s*\d{2}/\d{4})",
     r"\bUscita prevista\s*:\s*([^\n<]{3,40})"
 ]
 DEAD_PATTERNS = [
@@ -177,54 +176,46 @@ def extract_eta_deadline(full_text):
     return eta, dead
 
 def scrape_page(url, sel_desc=None, sel_gallery=None, zip_override=None):
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=45)
-        if r.status_code != 200:
-            return {"desc":"", "images":[], "zip_url":None, "full_text":""}
-    except:
-        return {"desc":"", "images":[], "zip_url":None, "full_text":""}
+    html_rendered, zip_bytes = rendered_page(url)
+    soup = BeautifulSoup(html_rendered, "lxml")
 
-    soup = BeautifulSoup(r.text, "lxml")
-    desc_html = pick_desc_block(soup, selector_override=sel_desc)
+    # descrizione
+    desc_html = parse_description(soup, selector_override=sel_desc)
 
-    zip_url = zip_override or find_zip_link(url, soup)
-
-    # immagini: se c'è un selettore galleria, usalo per cercare <img>/<a>/<source>
+    # immagini: usa selettore galleria se fornito, altrimenti cerca a tappeto
     cand = []
     if sel_gallery:
-        gal = soup.select(sel_gallery)
-        for g in gal:
+        for g in soup.select(sel_gallery):
             cand += [a.get("href") for a in g.select("a[href]")]
             for im in g.find_all("img"):
-                for attr in ("data-zoom-image","data-large_image","data-src","src","data-original"):
-                    v = im.get(attr)
-                    if v: cand.append(v)
+                cand += [im.get(k) for k in ("data-zoom-image","data-large_image","data-src","src","data-original") if im.get(k)]
             for s in g.select("source[srcset]"):
                 ss = s.get("srcset") or ""
                 for part in ss.split(","):
                     u = part.strip().split(" ")[0]
                     if u: cand.append(u)
     else:
-        cand = pick_image_candidates(soup)
+        # tutto il documento
+        for a in soup.select("a[href]"): cand.append(a.get("href"))
+        for im in soup.find_all("img"):
+            for k in ("data-zoom-image","data-large_image","data-src","src","data-original"):
+                v = im.get(k); 
+                if v: cand.append(v)
+        for s in soup.select("source[srcset]"):
+            ss = s.get("srcset") or ""
+            for part in ss.split(","):
+                u = part.strip().split(" ")[0]
+                if u: cand.append(u)
 
     imgs = keep_images(url, cand)
     full_text = soup.get_text(" ", strip=True)
-    return {"desc": desc_html, "images": imgs, "zip_url": zip_url, "full_text": full_text}
 
-# ========= MEDIA =========
-def media_bulk_import(urls, folder="media-root/preordini"):
-    if not urls: return []
-    payload = {"files":[{"url":u,"displayName": os.path.basename(urlparse(u).path) or f"image_{i}.jpg","filePath":folder} for i,u in enumerate(urls)]}
-    r = http("POST", f"{MEDIA_V1}/files/bulk-import-file", data=json.dumps(payload))
-    if r.status_code != 200:
-        print(f"[WARN] Bulk Import {r.status_code}: {r.text[:200]}")
-        return []
-    data = r.json(); out=[]
-    for f in data.get("files", []):
-        fid = f.get("id")
-        if fid: out.append({"fileId": fid, "displayName": f.get("displayName")})
-    return out
+    # zip override (se passato da CSV)
+    if zip_override: zip_bytes = requests.get(zip_override, headers={"User-Agent": USER_AGENT}, timeout=60).content
 
+    return {"desc": desc_html, "images": imgs, "zip_bytes": zip_bytes, "full_text": full_text}
+
+# ===== Media upload (solo upload bytes; niente bulk-import) =====
 def media_upload_bytes(name, content, folder="media-root/preordini"):
     headers = {k:v for k,v in session.headers.items() if k.lower()!="content-type"}
     files = {"file": (name, content, mimetypes.guess_type(name)[0] or "application/octet-stream")}
@@ -245,12 +236,14 @@ def product_add_media(product_id, files):
 
 def import_images(scraped):
     out=[]
-    if scraped.get("zip_url"):
+    # 1) ZIP scaricato via Playwright
+    if scraped.get("zip_bytes"):
         try:
-            z = requests.get(scraped["zip_url"], headers={"User-Agent": USER_AGENT}, timeout=120)
-            z.raise_for_status()
-            with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
+            with zipfile.ZipFile(io.BytesIO(scraped["zip_bytes"])) as zf:
+                # tieni solo immagini più grandi (filename più grande/risoluzione maggiore)
                 names = [n for n in zf.namelist() if os.path.splitext(n.lower())[1] in IMG_EXT]
+                # ordina mettendo per ultimi (e quindi scelti) i file con 'large','xl','original'
+                names.sort(key=lambda n: (not any(t in n.lower() for t in ["xl","large","orig","original"]), n))
                 for n in names:
                     with zf.open(n) as fh:
                         data = fh.read()
@@ -262,14 +255,21 @@ def import_images(scraped):
         except Exception as e:
             print(f"[WARN] ZIP import fallito: {e}")
 
+    # 2) URL immagini: scarico bytes e carico
     urls = scraped.get("images") or []
-    if urls:
-        out = media_bulk_import(urls)
-        if out:
-            print(f"[INFO] Import URL: {len(out)} immagini caricate")
+    for i, u in enumerate(urls, start=1):
+        try:
+            r = requests.get(u, headers={"User-Agent": USER_AGENT}, timeout=30)
+            r.raise_for_status()
+            name = os.path.basename(urlparse(u).path) or f"image_{i}.jpg"
+            up = media_upload_bytes(name, r.content)
+            if up: out.append(up)
+        except Exception as e:
+            print(f"[WARN] Scarico immagine fallito: {u} -> {e}")
+    if out: print(f"[INFO] Import URL: {len(out)} immagini caricate")
     return out
 
-# ========= CATEGORIE / COLLECTIONS =========
+# ===== Categorie / Collections =====
 def categories_by_name():
     r = http("POST", f"{CATEGORIES_V1}/categories/query", data=json.dumps({"query":{}}))
     if r.status_code != 200: return {}
@@ -301,13 +301,12 @@ def add_to_category_or_collection(product_id, name):
 
     print(f"[WARN] Nessuna categoria/collection trovata per '{name}'")
 
-# ========= PRODUCT =========
+# ===== Product =====
 OPTION_NAME = "PREORDER PAYMENTS OPTIONS*"
 CHOICE_DEPOSIT = "ANTICIPO/SALDO"
 CHOICE_FULL    = "PAGAMENTO ANTICIPATO"
 
 def make_payload(row):
-    # v6/v7 compat + opzionali
     name   = gf(row,"nome_articolo","Nome articolo")
     price  = gf(row,"prezzo_eur","Prezzo")
     url_d  = gf(row,"url_produttore","URL pagina distributore")
@@ -320,17 +319,17 @@ def make_payload(row):
     eta    = gf(row,"eta","ETA (mm/aaaa o gg/mm/aaaa)")
     imgs_x = gf(row,"immagini_urls","URL immagini extra (separate da |) [opzionale]")
 
-    sel_desc    = gf(row, "Selettore descrizione (opzionale)")
-    sel_gallery = gf(row, "Selettore galleria (opzionale)")
-    zip_override= gf(row, "ZIP immagini (opzionale)")
+    sel_desc    = gf(row, "Selettore descrizione (opzionale)") or None
+    sel_gallery = gf(row, "Selettore galleria (opzionale)") or None
+    zip_override= gf(row, "ZIP immagini (opzionale)") or None
 
     if not name or not price or not url_d:
         raise ValueError("mancano nome/prezzo/url_distributore")
 
     base_price = round(float(str(price).replace(",", ".")), 2)
 
-    # scrape pagina
-    scraped = scrape_page(url_d, sel_desc or None, sel_gallery or None, zip_override or None)
+    # render + scrape
+    scraped = scrape_page(url_d, sel_desc, sel_gallery, zip_override)
     e2, d2 = extract_eta_deadline(scraped.get("full_text",""))
     eta = eta or e2
     scad = scad or d2
@@ -346,7 +345,7 @@ def make_payload(row):
     extra = [u.strip() for u in imgs_x.split("|")] if imgs_x else []
     scraped["images"] = (scraped.get("images") or []) + extra
 
-    # varianti: metto anche currency
+    # varianti
     p_deposit = round(base_price * 0.30, 2)
     p_full    = round(base_price * 0.95, 2)
 
@@ -355,7 +354,7 @@ def make_payload(row):
         "productType": "physical",
         "visible": True,
         "description": description,
-        "priceData": {"price": base_price, "currency": "EUR"},
+        "priceData": {"price": base_price, "currency":"EUR"},
         "sku": sku or None,
         "brand": brand or None,
         "weight": float(peso.replace(",", ".")) if peso else None,
@@ -376,8 +375,7 @@ def make_payload(row):
     return product, scraped, cat
 
 def create_product(product):
-    body = {"product": product}
-    r = http("POST", f"{STORES_V1}/products", data=json.dumps(body))
+    r = http("POST", f"{STORES_V1}/products", data=json.dumps({"product": product}))
     return r
 
 def get_product(pid):
@@ -386,13 +384,11 @@ def get_product(pid):
     except: return {}
 
 def patch_variants(pid, variants):
-    body = {"product": {"id": pid, "variants": variants}}
-    r = http("PATCH", f"{STORES_V1}/products/{pid}", data=json.dumps(body))
+    r = http("PATCH", f"{STORES_V1}/products/{pid}", data=json.dumps({"product":{"id":pid,"variants":variants}}))
     return r
 
-# ========= RUN =========
 def run(csv_path):
-    # precheck
+    # precheck API
     t = http("POST", f"{STORES_V1}/products/query", data=json.dumps({"query":{"paging":{"limit":1}}}))
     if t.status_code != 200:
         fail(f"[ERRORE] API non valide: {t.status_code} {t.text}")
@@ -428,7 +424,7 @@ def run(csv_path):
         except Exception as e:
             print(f"[WARN] Categoria/Collection: {e}")
 
-        # check prezzi varianti e se serve patch, poi ricontrollo
+        # check varianti e patch se serve
         stored = get_product(pid)
         try:
             sv = stored.get("variants", []) or []
@@ -453,7 +449,6 @@ def run(csv_path):
             if needs_patch:
                 pr = patch_variants(pid, patched)
                 print(f"[CHECK] Patch varianti -> {pr.status_code}")
-                # ri-leggo per conferma
                 stored2 = get_product(pid)
                 sv2 = stored2.get("variants", []) or []
                 print("[CHECK] Varianti dopo patch:", [(x.get('choices'), (x.get('priceData') or {}).get('price'), x.get('price')) for x in sv2])
