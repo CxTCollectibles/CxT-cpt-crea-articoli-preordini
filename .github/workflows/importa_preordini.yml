@@ -1,19 +1,15 @@
-name: Importa Preordini su Wix (MIN)
+name: Importa Preordini (manual)
 
 on:
   workflow_dispatch:
     inputs:
-      csv_path:
-        description: "Percorso CSV nel repo (es. input/template_preordini_v5.csv)"
-        required: true
-        default: "input/template_preordini_v5.csv"
-      dry_run:
-        description: "1 = simulazione (non crea su Wix), 0 = crea"
+      csv_file:
+        description: "Percorso CSV dentro al repo (default: input/template_preordini_v7.csv)"
         required: false
-        default: "0"
+        default: "input/template_preordini_v7.csv"
 
 jobs:
-  import:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -24,50 +20,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
-      - name: Test credenziali Wix
+      - name: Precheck credenziali
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
         run: |
           set -e
-          echo "Provo POST /stores/v1/products/query"
-          code=$(curl -s -o /tmp/out.json -w "%{http_code}" \
-            -X POST "https://www.wixapis.com/stores/v1/products/query" \
-            -H "Authorization: $WIX_API_KEY" \
-            -H "Content-Type: application/json" \
-            -H "wix-site-id: $WIX_SITE_ID" \
-            -d '{"query":{}}')
-          echo "HTTP $code"
-          head -c 800 /tmp/out.json || true; echo
-          if [ "$code" -ge 300 ]; then exit 1; fi
+          echo "Testo le API con metaSiteId: $WIX_SITE_ID"
+          curl -s -X POST "https://www.wixapis.com/stores/v1/products/query" \
+            -H "Authorization: $WIX_API_KEY" -H "wix-site-id: $WIX_SITE_ID" -H "Content-Type: application/json" \
+            -d '{"query":{"paging":{"limit":1}}}' | head -c 300 || true
+          echo; echo "Se sopra non vedi prodotti e status 200, controlla chiavi/permessi."
 
-      - name: Run importer
+      - name: Esegui import
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          python wix_preorder_ingestion.py --csv "${{ github.event.inputs.csv_path }}"
-
-      - name: Riepilogo & artifact
-        if: always()
-        run: |
-          echo "--- created_products.json ---"
-          test -f created_products.json && cat created_products.json || echo "Nessun file di riepilogo"
-          echo "--- artifacts/ ---"
-          ls -la artifacts || true
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wix-run-artifacts
-          path: |
-            artifacts
-            created_products.json
-          if-no-files-found: warn
+          set -e
+          python wix_preorder_ingestion.py --csv "${{ github.event.inputs.csv_file }}"
