@@ -1,479 +1,391 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, csv, re, json, argparse, requests, unicodedata
+
+import os, sys, csv, time, math, re, html
+import json
+import argparse
+import requests
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
-ARTDIR = "artifacts"
-os.makedirs(ARTDIR, exist_ok=True)
+WIX_API_KEY  = os.getenv("WIX_API_KEY", "").strip()
+WIX_SITE_ID  = os.getenv("WIX_SITE_ID", "").strip()  # ATTENZIONE: deve essere il metaSiteId (quello che hai verificato con HTTP 200)
+USER_AGENT   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-# ====== Opzioni / varianti ======
-OPTION_NAME = "PREORDER PAYMENTS OPTIONS*"
-CHOICE_DEPOSIT = "ANTICIPO/SALDO"
-CHOICE_FULLPAY = "PAGAMENTO ANTICIPATO"
+# Endpoint base
+STORES_BASE   = "https://www.wixapis.com/stores/v1"
+STORES_V3     = "https://www.wixapis.com/stores/v3"
+READER_BASE   = "https://www.wixapis.com/stores-reader/v1"
+CATEGORIES_API= "https://www.wixapis.com/categories/v1"
+MEDIA_API     = "https://www.wixapis.com/site-media/v1"
 
-# Alias categorie comode
-CATEGORY_ALIASES = {
-    "statue": "Statue da collezione",
-    "statua": "Statue da collezione",
-    "statue da collezione": "Statue da collezione",
-    "action figures": "Action Figures da Collezione",
-    "repliche": "Repliche Cinematografiche",
-}
+# AppId Wix Stores per Categories API (serve quando aggiungiamo item a una categoria)
+WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e"
 
-# ---------------- Utils ----------------
-def slugify(s):
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
-    s = re.sub(r"[^a-zA-Z0-9]+","-", s).strip("-").lower()
-    return s[:80] or "articolo"
+session = requests.Session()
+session.headers.update({
+    "Authorization": WIX_API_KEY,
+    "wix-site-id": WIX_SITE_ID,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "User-Agent": USER_AGENT
+})
 
-def to_float_kg(s):
-    if s is None: return None
-    s = str(s).strip()
-    if not s: return None
-    try:
-        return float(s.replace(",", "."))
-    except:
-        m = re.search(r"([\d\.]+)\s*(kg|g)\b", s, re.I)
-        if m:
-            v = float(m.group(1).replace(",", "."))
-            return v/1000.0 if m.group(2).lower()=="g" else v
-    return None
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
 
-def compute_prices(base):
-    base = float(base)
-    deposito = round(base * 0.30, 2)
-    anticipato = round(base * 0.95, 2)
-    return deposito, anticipato
+def http(method, url, **kwargs):
+    for attempt in range(3):
+        r = session.request(method, url, timeout=30, **kwargs)
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        return r
+    return r
 
-def prune(x):
-    if isinstance(x, dict):
-        out = {}
-        for k,v in x.items():
-            pv = prune(v)
-            if pv in (None, "", {}, []): 
-                continue
-            out[k] = pv
-        return out
-    if isinstance(x, list):
-        out = [prune(v) for v in x]
-        return [v for v in out if v not in (None,"",{},[])]
-    return x
+def price_round(x):
+    return round(float(x) + 1e-9, 2)
 
-def normalize_name(s):
-    if not s: return ""
-    s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
+def parse_csv(path):
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader, start=2):
+            rows.append((i, row))
+    return rows
 
-# ---------------- CSV ----------------
-def read_rows(csv_path):
-    # Prova automatica delimiter , ; \t
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096); f.seek(0)
+def abs_urls(base, urls):
+    out = []
+    for u in urls:
         try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t"])
-        except Exception:
-            class _D: delimiter = ";"
-            dialect = _D()
-        reader = csv.DictReader(f, dialect=dialect)
-        count = 0
-        for i,row in enumerate(reader, start=2):
-            row = {k:v for k,v in row.items() if k is not None and not str(k).startswith("__")}
-            norm = { (k or "").strip().lower(): (v or "").strip() for k,v in row.items() }
-            if not (norm.get("nome_articolo") or norm.get("prezzo_eur") or norm.get("url_produttore")):
+            if not u: 
                 continue
-            count += 1
-            yield i, norm
-        if count == 0:
-            print("[WARN] Nessuna riga valida trovata nel CSV.")
-
-# ---------------- Scraping ----------------
-MONTHS = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|gen(?:naio)?|feb(?:braio)?|mar(?:zo)?|apr(?:ile)?|mag(?:gio)?|giu(?:gno)?|lug(?:lio)?|ago(?:sto)?|set(?:tembre)?|ott(?:obre)?|nov(?:embre)?|dic(?:embre)?|jan|feb|märz|apr|mai|jun|jul|aug|sep|okt|nov|dez)"
-
-def extract_eta_deadline(text):
-    txt = " ".join(text.split())
-    eta = None
-    deadline = None
-    # Qx - Qy 20xx
-    m = re.search(r"\bQ[1-4]\s*-\s*Q[1-4]\s*20\d{2}\b", txt, re.I)
-    if m: eta = m.group(0)
-    if not eta:
-        m = re.search(r"\bQ[1-4]\s*20\d{2}\b", txt, re.I)
-        if m: eta = m.group(0)
-    # Month Year
-    if not eta:
-        m = re.search(rf"\b{MONTHS}\s+20\d{{2}}\b", txt, re.I)
-        if m: eta = m.group(0).title()
-    # Phrasal
-    if not eta:
-        m = re.search(r"(release|eta|uscita|rilascio|lieferung|voraussicht)\s*[:\-]?\s*([A-Za-z0-9\s\-\./]+20\d{2})", txt, re.I)
-        if m:
-            cand = m.group(2).strip()
-            cand = re.split(r"[;,]|(\s{2,})", cand)[0]
-            eta = cand
-    # Deadline dd/mm/yyyy or dd.mm.yyyy
-    m = re.search(r"(pre[-\s]?order|chiusura\s+preordine|order\s+deadline|bestellschluss)\s*[:\-]?\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})", txt, re.I)
-    if m:
-        deadline = m.group(2).replace(".", "/")
-        parts = deadline.split("/")
-        if len(parts[-1]) == 2: parts[-1] = "20"+parts[-1]
-        deadline = "/".join(parts)
-    return eta, deadline
-
-def prefer_english(texts):
-    # Sceglie il testo che sembra più "inglese" e lungo
-    def score(t):
-        t0 = t.lower()
-        eng_hits = sum(1 for w in ["the","and","with","figure","statue","scale","includes","features","inch","cm","preorder"] if w in t0)
-        return (eng_hits*50) + len(t)
-    texts = [t for t in texts if t and len(t.strip()) > 60]
-    if not texts: return None
-    texts.sort(key=score, reverse=True)
-    return texts[0]
-
-def extract_description(soup: BeautifulSoup):
-    # 1) JSON-LD
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or "")
-            if isinstance(data, list):
-                for d in data:
-                    if isinstance(d, dict) and str(d.get("@type","")).lower() == "product" and d.get("description"):
-                        return d["description"]
-            elif isinstance(data, dict) and str(data.get("@type","")).lower() == "product" and data.get("description"):
-                return data["description"]
-        except Exception:
+            o = urlparse(u)
+            out.append(u if o.scheme in ("http","https") else urljoin(base, u))
+        except:
             pass
-    # 2) Meta
-    for sel,attr,val in [('meta','property','og:description'), ('meta','name','description'), ('meta','property','og:description:secure')]:
-        el = soup.find(sel, attrs={attr: val})
-        if el and el.get("content"): 
-            return el.get("content")
-    # 3) Blocchi "sotto le foto"
-    cands = []
-    selectors = [
-        ".product-description", "#description", ".description", "article",
-        ".product-single__description", ".product-info__description", ".short-description",
-        "#tab-description", "[data-tab='description']", ".tabs-content", ".tab-content",
-        ".product__description", ".desc"
-    ]
-    for sel in selectors:
-        n = soup.select_one(sel)
-        if n:
-            txt = n.get_text("\n", strip=True)
-            if txt and len(txt) > 80:
-                cands.append(txt)
-    if cands:
-        best = prefer_english(cands) or max(cands, key=len)
-        return best
-    # 4) Paragrafi lunghi
-    longp = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-    longp = [t for t in longp if len(t) > 120]
-    if longp:
-        return prefer_english(longp) or max(longp, key=len)
-    return None
-
-def fetch_from_page(url):
-    out = {"images":[], "sku":None, "ean":None, "weight_kg":None, "description":None, "eta":None, "deadline":None}
-    try:
-        headers = {"User-Agent":"Mozilla/5.0 (compatible; CPT-Importer/1.0)"}
-        r = requests.get(url, headers=headers, timeout=25)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-
-        out["description"] = extract_description(soup)
-
-        # Immagini: og:image / secure, <img>, <picture><source srcset>, data-zoom-image, link a .jpg/.png
-        seen = set()
-        def ok(u):
-            u = (u or "").strip()
-            u2 = u.lower()
-            bad = ("thumb", "thumbnail", "small_", "/small/", "icon", "placeholder", "lazy", "50x50", "100x100", "150x150")
-            return u.startswith("http") and not any(b in u2 for b in bad)
-
-        for key in ["og:image:secure_url", "og:image"]:
-            q = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
-            if q and q.get("content"):
-                u = q.get("content").strip()
-                if ok(u) and u not in seen: out["images"].append(u); seen.add(u)
-
-        for img in soup.find_all("img"):
-            src = img.get("src") or img.get("data-src") or img.get("data-original") or img.get("data-image") or img.get("data-large") or img.get("data-zoom-image") or ""
-            if src.startswith("//"): src = "https:"+src
-            if ok(src) and src not in seen:
-                out["images"].append(src); seen.add(src)
-
-        for src in soup.select("source[srcset]"):
-            ss = src.get("srcset") or ""
-            for part in ss.split(","):
-                u = part.strip().split(" ")[0]
-                if u.startswith("//"): u = "https:"+u
-                if ok(u) and u not in seen:
-                    out["images"].append(u); seen.add(u)
-
-        for a in soup.select("a[href]"):
-            href = a.get("href","")
-            if any(href.lower().endswith(ext) for ext in [".jpg",".jpeg",".png",".webp"]):
-                if href.startswith("//"): href = "https:"+href
-                if ok(href) and href not in seen:
-                    out["images"].append(href); seen.add(href)
-
-        text = soup.get_text("\n", strip=True)
-        m = re.search(r"\b(\d{8,14})\b", text);  out["ean"] = m.group(1) if m else None
-        for pat in [r"SKU[:\s]+([A-Z0-9\-\._/]+)", r"Cod(?:ice)?\s*[:\s]+([A-Z0-9\-\._/]+)"]:
-            m = re.search(pat, text, re.I)
-            if m and not out["sku"]:
-                out["sku"] = m.group(1)
-        m = re.search(r"(?:peso|weight)\s*[:\s]+([\d\.,]+)\s*(kg|g)\b", text, re.I)
-        if m:
-            val = float(m.group(1).replace(",", "."))
-            out["weight_kg"] = val/1000.0 if m.group(2).lower()=="g" else val
-
-        e, d = extract_eta_deadline(text)
-        out["eta"], out["deadline"] = e, d
-
-    except Exception as e:
-        print(f"[WARN] fetch_from_page: {e}")
     return out
 
-# ---------------- Wix API ----------------
-def wix_request(method, url, api_key, site_id, payload=None):
-    headers = {"Content-Type":"application/json", "Authorization": api_key, "wix-site-id": site_id}
-    data = json.dumps(prune(payload)) if payload is not None else None
-    r = requests.request(method, url, headers=headers, data=data, timeout=45)
-    if r.status_code >= 300:
-        raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text[:1200]}")
-    if r.text.strip():
-        try:
-            return r.json()
-        except Exception:
-            return {}
-    return {}
+# ---------- SCRAPER DESCRIZIONE + IMMAGINI ----------
 
-def precheck(api_key, site_id):
+IMG_EXT = (".jpg",".jpeg",".png",".webp",".gif",".jfif")
+
+def scrape_product_page(url):
+    """Ritorna (descrizione_html, lista_url_immagini)"""
     try:
-        res = wix_request("POST", "https://www.wixapis.com/stores/v1/products/query", api_key, site_id, {"query":{}})
-        items = res.get("products") or res.get("items") or []
-        print(f"[PRECHECK] API ok. Prodotti visibili: {len(items)}")
-        return True
-    except Exception as e:
-        print(f"[PRECHECK] FALLITO: {e}")
-        return False
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+        if r.status_code != 200:
+            return None, []
+    except:
+        return None, []
+    base = "{uri.scheme}://{uri.netloc}/".format(uri=urlparse(url))
+    soup = BeautifulSoup(r.text, "lxml")
 
-def create_product_v1(api_key, site_id, product):
-    return wix_request("POST", "https://www.wixapis.com/stores/v1/products", api_key, site_id, {"product": product})
+    # 1) DESCRIZIONE: euristiche comuni
+    desc = None
 
-def add_media_v1(api_key, site_id, product_id, urls):
-    urls = [u for u in urls if isinstance(u,str) and u.startswith("http")]
-    if not urls: return
-    items = [{"src": u} for u in urls[:20]]
-    try:
-        wix_request("POST", f"https://www.wixapis.com/stores/v1/products/{product_id}/media",
-                    api_key, site_id, {"mediaItems": items})
-    except Exception as e:
-        print(f"[WARN] Add media failed: {e}")
+    # blocchi classici
+    candidates = [
+        {"name":"div", "attrs":{"class": re.compile("(product[-_ ](desc|description)|description|product-info)", re.I)}},
+        {"name":"section", "attrs":{"class": re.compile("(description|details)", re.I)}},
+        {"name":"div", "attrs":{"id": re.compile("description", re.I)}},
+        {"name":"article", "attrs":{}},
+    ]
+    for c in candidates:
+        el = soup.find(c.get("name"), c.get("attrs"))
+        if el and el.get_text(strip=True):
+            # spesso sotto le foto; prendi primi <p> sostanziosi
+            ps = [p for p in el.find_all(["p","li"]) if p.get_text(strip=True)]
+            if ps:
+                chunk = " ".join([str(p) for p in ps[:6]])
+                desc = chunk
+                break
 
-def list_collections(api_key, site_id):
-    try:
-        res = wix_request("POST","https://www.wixapis.com/stores/v1/collections/query",
-                          api_key, site_id, {"query":{"paging":{"limit": 500}}})
-        return (res.get("collections") or res.get("items") or [])
-    except Exception as e:
-        print(f"[WARN] Query collections: {e}")
-        return []
+    # fallback: meta description
+    if not desc:
+        meta = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", attrs={"property":"og:description"})
+        if meta and meta.get("content"):
+            desc = f"<p>{html.escape(meta['content'])}</p>"
 
-def list_categories(api_key, site_id):
-    try:
-        res = wix_request("POST","https://www.wixapis.com/stores/v1/categories/query",
-                          api_key, site_id, {"query":{"paging":{"limit": 500}}})
-        return (res.get("categories") or res.get("items") or [])
-    except Exception:
-        return []
+    # 2) IMMAGINI: prova galleria, poi og:image, poi tutte le <img> “grandi”
+    imgs = []
 
-def find_category_or_collection_id(api_key, site_id, name):
-    if not name: return None
-    target = CATEGORY_ALIASES.get(name.strip().lower(), name).strip()
-    norm_target = normalize_name(target)
+    # gallerie
+    for sel in [
+        ("div", {"class": re.compile("(gallery|product[-_ ]images|carousel|slick|swiper)", re.I)}),
+        ("ul", {"class": re.compile("(thumb|gallery)", re.I)}),
+    ]:
+        gal = soup.find(*sel)
+        if gal:
+            for im in gal.find_all("img"):
+                src = im.get("src") or im.get("data-src") or im.get("data-large_image") or im.get("data-zoom-image")
+                if src:
+                    imgs.append(src)
 
-    items = list_collections(api_key, site_id) + list_categories(api_key, site_id)
-    for c in items:
-        nm = (c.get("name") or "").strip()
-        if normalize_name(nm) == norm_target:
-            return c.get("id")
-    # ultimo tentativo: startswith
-    for c in items:
-        nm = (c.get("name") or "").strip()
-        if normalize_name(nm).startswith(norm_target):
-            return c.get("id")
-    return None
+    # og:image
+    og = soup.find("meta", attrs={"property":"og:image"})
+    if og and og.get("content"):
+        imgs.append(og["content"])
 
-def add_product_to_collection(api_key, site_id, col_id, product_id):
-    if not col_id or not product_id: return
-    try:
-        wix_request("POST", f"https://www.wixapis.com/stores/v1/collections/{col_id}/productIds",
-                    api_key, site_id, {"productIds":[product_id]})
-    except Exception as e:
-        print(f"[WARN] Add to collection: {e}")
-
-# ---------------- Main ----------------
-def parse_image_list_field(s):
-    if not s: return []
-    parts = [p.strip() for p in str(s).split("|")]
-    return [p for p in parts if p.startswith("http")]
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--csv", required=True)
-    args = p.parse_args()
-
-    api_key = os.getenv("WIX_API_KEY","").strip()
-    site_id = os.getenv("WIX_SITE_ID","").strip()
-    dry = os.getenv("DRY_RUN","0").strip() == "1"
-    skip_pre = os.getenv("SKIP_PRECHECK","0").strip() == "1"
-
-    if not api_key or not site_id:
-        print("Errore: imposta WIX_API_KEY e WIX_SITE_ID come env.")
-        sys.exit(1)
-
-    if not skip_pre:
-        if not precheck(api_key, site_id):
-            print("[INFO] Precheck fallito. Interrompo per evitare sorprese.")
-            sys.exit(3)
-    else:
-        print("[INFO] SKIP_PRECHECK=1: salto il test di lettura e provo direttamente a creare.")
-
-    created = []
-
-    for rownum, r in read_rows(args.csv):
-        name = r.get("nome_articolo") or r.get("name")
-        urlp = r.get("url_produttore") or r.get("link_al_sito_del_produttore")
-        if not re.match(r"^https?://", urlp or ""):
-            print(f"[ERRORE] Riga {rownum}: url_produttore non valido"); 
+    # tutte le img, ma filtra piccole/icona
+    for im in soup.find_all("img"):
+        src = im.get("src") or im.get("data-src")
+        if not src:
             continue
-        try:
-            price = float((r.get("prezzo_eur") or r.get("prezzo") or "0").replace(",","."))
-            assert price > 0
-        except:
-            print(f"[ERRORE] Riga {rownum}: prezzo non valido"); 
-            continue
-
-        sku = r.get("sku") or None
-        peso = to_float_kg(r.get("peso_kg"))
-        descr = r.get("descrizione") or ""
-        brand = r.get("brand") or ""
-        categoria = r.get("categoria") or ""
-        categoria = CATEGORY_ALIASES.get(categoria.strip().lower(), categoria).strip()
-
-        preorder_deadline = r.get("preorder_scadenza") or ""
-        eta = r.get("eta") or ""
-        images_from_csv = parse_image_list_field(r.get("immagini_urls"))
-        visible = (r.get("visibile_online") or "SI").strip().upper() != "NO"
-        tipo = (r.get("tipo_articolo") or "PREORDER").strip().upper()
-        is_preorder = (tipo == "PREORDER")
-
-        scraped = fetch_from_page(urlp)
-        if not descr: descr = scraped.get("description") or name
-        if not eta and scraped.get("eta"): eta = scraped["eta"]
-        if not preorder_deadline and scraped.get("deadline"): preorder_deadline = scraped["deadline"]
-        if peso is None: peso = scraped.get("weight_kg")
-        if not sku: sku = scraped.get("sku")
-        images = images_from_csv or scraped.get("images") or []
-
-        # prepend “Uscita prevista / Chiusura preordine” in cima alla descrizione
-        header_lines = []
-        if eta:
-            header_lines.append(f"Uscita prevista: {eta}")
-        if preorder_deadline:
-            header_lines.append(f"Chiusura preordine : {preorder_deadline} Salvo esaurimento")
-        if header_lines:
-            header_block = "\n".join(header_lines)
-            descr = f"{header_block}\n\n{descr}"
-
-        slug = f"{slugify(name)}-{sku.lower()}" if sku else slugify(name)
-
-        product = {
-            "name": name,
-            "slug": slug,
-            "visible": visible,
-            "productType": "physical",
-            "description": descr,
-            "priceData": {"price": price},
-            "brand": brand or None,
-            "mediaItems": [{"src": u} for u in images[:10] if u.startswith("http")] or None,
-            "ribbon": "PREORDINE" if is_preorder else None,
-            "manageVariants": True if is_preorder else False
-        }
-
-        if is_preorder:
-            deposito, anticipato = compute_prices(price)
-            product["productOptions"] = [{
-                "name": OPTION_NAME,
-                "choices": [
-                    {"value": CHOICE_DEPOSIT, "description": CHOICE_DEPOSIT},
-                    {"value": CHOICE_FULLPAY, "description": CHOICE_FULLPAY}
-                ]
-            }]
-            product["variants"] = [
-                {"choices": {OPTION_NAME: CHOICE_DEPOSIT},
-                 "priceData": {"price": deposito},
-                 **({"sku": f"{sku}-DEP"} if sku else {}),
-                 **({"weight": peso} if peso is not None else {})},
-                {"choices": {OPTION_NAME: CHOICE_FULLPAY},
-                 "priceData": {"price": anticipato},
-                 **({"sku": f"{sku}-FULL"} if sku else {}),
-                 **({"weight": peso} if peso is not None else {})}
-            ]
-
-        # Salva payload per debug
-        with open(os.path.join(ARTDIR, f"payload_row_{rownum}.json"), "w", encoding="utf-8") as f:
-            json.dump({"product": product}, f, ensure_ascii=False, indent=2)
-
-        if dry:
-            print(f"[DRY-RUN] Riga {rownum}: simulazione, nessuna creazione.")
-            continue
-
-        # Crea il prodotto
-        try:
-            res = create_product_v1(api_key, site_id, product)
-            pid = res.get("product",{}).get("id")
-            with open(os.path.join(ARTDIR, f"response_row_{rownum}.json"), "w", encoding="utf-8") as f:
-                json.dump(res, f, ensure_ascii=False, indent=2)
-            if not pid:
-                print(f"[ERRORE] Riga {rownum}: risposta senza product.id (vedi artifacts/response_row_{rownum}.json)")
+        w = (im.get("width") or "").strip()
+        h = (im.get("height") or "").strip()
+        if w.isdigit() and h.isdigit():
+            if int(w) < 400 and int(h) < 400:
                 continue
-            print(f"[OK] Riga {rownum} creato prodotto id={pid} :: {name}")
+        imgs.append(src)
+
+    imgs = abs_urls(base, imgs)
+    # filtra per estensione e dedup
+    seen = set()
+    clean = []
+    for u in imgs:
+        low = u.lower().split("?")[0]
+        if not low.endswith(IMG_EXT):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        clean.append(u)
+    return desc, clean[:15]
+
+# ---------- MEDIA MANAGER UPLOAD ----------
+
+def media_bulk_import(image_urls, folder_path="media-root/preordini"):
+    """
+    Usa Bulk Import File per importare URL esterni nella Media Manager.
+    Ritorna una lista di dizionari {fileId, displayName}
+    """
+    if not image_urls:
+        return []
+
+    payload = {
+        "files": [
+            {
+                "url": u,
+                "displayName": os.path.basename(urlparse(u).path) or f"image_{i}.jpg",
+                # Suggeriamo il mimeType se manca l'estensione chiara
+                # "mimeType": "image/jpeg",
+                "filePath": folder_path
+            } for i, u in enumerate(image_urls)
+        ]
+    }
+    r = http("POST", f"{MEDIA_API}/files/bulk-import-file", data=json.dumps(payload))
+    if r.status_code != 200:
+        print(f"[WARN] Bulk Import fallito {r.status_code}: {r.text}")
+        return []
+
+    data = r.json()
+    # data["files"] lista file con .id e operationStatus. Aspetta READY.
+    results = []
+    for f in data.get("files", []):
+        # poll semplice se non READY
+        fid = f.get("id")
+        status = (f.get("operationStatus") or "").upper()
+        tries = 0
+        while status not in ("READY","COMPLETED") and tries < 6 and fid:
+            time.sleep(1.0)
+            q = http("GET", f"{MEDIA_API}/files/{fid}")
+            if q.status_code == 200:
+                status = (q.json().get("file", {}).get("operationStatus") or "").upper()
+            else:
+                break
+            tries += 1
+        if fid:
+            results.append({"fileId": fid, "displayName": f.get("displayName")})
+    return results
+
+def add_media_to_product(product_id, imported_files):
+    if not imported_files:
+        return
+    body = {"mediaItems": [{"fileId": f["fileId"]} for f in imported_files]}
+    r = http("POST", f"{STORES_BASE}/products/{product_id}/media", data=json.dumps(body))
+    if r.status_code != 200:
+        print(f"[WARN] Add Product Media fallita {r.status_code}: {r.text}")
+
+# ---------- CATEGORIE ----------
+
+def query_all_categories():
+    # recupera tutte le categorie del sito
+    payload = {"query": {}}
+    cats = []
+    r = http("POST", f"{CATEGORIES_API}/categories/query", data=json.dumps(payload))
+    if r.status_code != 200:
+        print(f"[WARN] Query Categories {r.status_code}: {r.text}")
+        return {}
+    data = r.json()
+    cats.extend(data.get("categories", []))
+    # TODO: se serve paginazione, aggiungerla
+    by_name = {}
+    for c in cats:
+        nm = (c.get("name") or "").strip().lower()
+        if nm:
+            by_name[nm] = c.get("id")
+    return by_name
+
+def add_product_to_category(product_id, category_name):
+    if not category_name:
+        return
+    cmap = query_all_categories()
+    cid = cmap.get(category_name.strip().lower())
+    if not cid:
+        print(f"[WARN] Categoria '{category_name}' non trovata, salto assegnazione.")
+        return
+    body = {
+        "items": [
+            {"catalogItemId": product_id, "appId": WIX_STORES_APP_ID}
+        ]
+    }
+    r = http("POST", f"{CATEGORIES_API}/bulk/categories/{cid}/add-items", data=json.dumps(body))
+    if r.status_code != 200:
+        print(f"[WARN] Add to Category fallita {r.status_code}: {r.text}")
+
+# ---------- CREAZIONE/AGGIORNAMENTO PRODOTTO ----------
+
+def create_product(payload):
+    r = http("POST", f"{STORES_BASE}/products", data=json.dumps(payload))
+    return r
+
+def make_product_payload(row):
+    name   = (row.get("Nome articolo") or "").strip()
+    price  = price_round(row.get("Prezzo") or 0)
+    sku    = (row.get("SKU") or "").strip()
+    brand  = (row.get("Brand (seleziona)") or row.get("Brand") or "").strip()
+    weight = float(row.get("Peso (kg)") or 0) if str(row.get("Peso (kg)") or "").strip() else None
+    ean    = (row.get("GTIN/EAN") or "").strip()
+    categoria = (row.get("Categoria (seleziona)") or row.get("Categoria") or "").strip()
+
+    # Descrizione: override se presente, altrimenti scraping
+    distributor_url = (row.get("URL pagina distributore") or "").strip()
+    desc_override   = (row.get("Descrizione override (opzionale)") or "").strip()
+    deadline = (row.get("Scadenza preordine (gg/mm/aaaa)") or "").strip()
+    eta      = (row.get("ETA (mm/aaaa o gg/mm/aaaa)") or "").strip()
+    extra_imgs = [u.strip() for u in (row.get("URL immagini extra (separate da |) [opzionale]") or "").split("|") if u.strip()]
+
+    scraped_desc, scraped_imgs = (None, [])
+    if distributor_url:
+        d, imgs = scrape_product_page(distributor_url)
+        scraped_desc, scraped_imgs = d, imgs
+
+    # Preorder banner inline a inizio descrizione (se forniti deadline/eta)
+    preorder_line = ""
+    if deadline or eta:
+        parts = []
+        if deadline:
+            parts.append(f"Scadenza preordine: {html.escape(deadline)}")
+        if eta:
+            parts.append(f"ETA: {html.escape(eta)}")
+        preorder_line = f"<p><strong>PREORDER</strong> — {' — '.join(parts)}</p>"
+
+    description_html = desc_override or scraped_desc or ""
+    description_html = (preorder_line + (description_html or "")) or preorder_line or ""
+
+    # Opzioni pagamento e varianti gestite
+    base_price = price
+    price_anticipo = price_round(base_price * 0.30)
+    price_anticipato = price_round(base_price * 0.95)
+
+    variants = [
+        {
+            "choices": {"Pagamento": "ANTICIPO/SALDO"},
+            "priceData": {"price": price_anticipo},
+            "sku": f"{sku}-AS" if sku else ""
+        },
+        {
+            "choices": {"Pagamento": "PAGAMENTO ANTICIPATO"},
+            "priceData": {"price": price_anticipato},
+            "sku": f"{sku}-PA" if sku else ""
+        }
+    ]
+
+    product_options = [
+        {
+            "name": "Pagamento",
+            "choices": [
+                {"value": "ANTICIPO/SALDO", "description": "ANTICIPO/SALDO"},
+                {"value": "PAGAMENTO ANTICIPATO", "description": "PAGAMENTO ANTICIPATO"}
+            ]
+        }
+    ]
+
+    payload = {
+        "name": name,
+        "productType": "physical",
+        "visible": True,
+        "description": description_html[:7900],  # limite 8000
+        "priceData": {"price": base_price},  # prezzo "listino"
+        "sku": sku or None,
+        "weight": weight if weight is not None else None,
+        "brand": brand or None,
+        "ribbon": "PREORDER",
+        "manageVariants": True,
+        "productOptions": product_options,
+        "variants": variants,
+    }
+
+    # GTIN/EAN nei custom fields se necessario: per ora mettiamo in additionalInfoSections
+    if ean:
+        payload.setdefault("additionalInfoSections", []).append({
+            "title": "GTIN/EAN",
+            "description": html.escape(ean)
+        })
+
+    return payload, scraped_imgs, extra_imgs, categoria
+
+def run(csv_path):
+    # precheck API
+    test = http("POST", f"{STORES_BASE}/products/query", data=json.dumps({"query": {"paging": {"limit": 1}}}))
+    if test.status_code != 200:
+        die(f"[ERRORE] API non valide o permessi insufficienti: {test.status_code} {test.text}")
+
+    rows = parse_csv(csv_path)
+    created = 0
+    for line_no, row in rows:
+        name = (row.get("Nome articolo") or "").strip()
+        try:
+            payload, scraped_imgs, extra_imgs, categoria = make_product_payload(row)
+            r = create_product(payload)
+            if r.status_code != 200:
+                print(f"[ERRORE] Riga {line_no} '{name}': POST {STORES_BASE}/products failed {r.status_code}: {r.text}")
+                continue
+            product = r.json().get("product") or {}
+            pid = product.get("id")
+            if not pid:
+                print(f"[ERRORE] Riga {line_no} '{name}': prodotto senza id")
+                continue
+
+            # IMMAGINI: priorità immagini da pagina, poi extra
+            image_urls = scraped_imgs + [u for u in extra_imgs if u]
+            imported = media_bulk_import(image_urls)
+            if imported:
+                add_media_to_product(pid, imported)
+            else:
+                print(f"[WARN] Riga {line_no} '{name}': nessuna immagine importata")
+
+            # Categoria
+            if categoria:
+                add_product_to_category(pid, categoria)
+
+            created += 1
+            # log variante per conferma
+            print(f"[OK] Creato '{name}' ({pid}). Varianti: ANTICIPO/SALDO={payload['variants'][0]['priceData']['price']} | PAGAMENTO ANTICIPATO={payload['variants'][1]['priceData']['price']}")
         except Exception as e:
-            with open(os.path.join(ARTDIR, f"response_row_{rownum}.json"), "w", encoding="utf-8") as f:
-                f.write(str(e))
-            print(f"[ERRORE] Riga {rownum} '{name}': {e}")
+            print(f"[ERRORE] Riga {line_no} '{name}': {e}")
             continue
 
-        # Foto in fallback (se non importate in creazione)
-        try:
-            if images:
-                add_media_v1(api_key, site_id, pid, images)
-        except Exception as e:
-            print(f"[WARN] Immagini non aggiunte (fallback): {e}")
-
-        # Categoria esistente
-        try:
-            if categoria:
-                cid = find_category_or_collection_id(api_key, site_id, categoria)
-                if cid:
-                    add_product_to_collection(api_key, site_id, cid, pid)
-                else:
-                    print(f"[WARN] Collezione/Categoria '{categoria}' non trovata. Non assegno categorie.")
-        except Exception as e:
-            print(f"[WARN] Collezioni: {e}")
-
-        created.append({"row": rownum, "id": pid, "name": name, "slug": slug})
-
-    with open("created_products.json", "w", encoding="utf-8") as f:
-        json.dump({"created": created}, f, ensure_ascii=False, indent=2)
-
-    if not created and os.getenv("DRY_RUN","0").strip() != "1":
-        print("[ERRORE] Nessun prodotto creato.")
-        sys.exit(2)
+    if created == 0:
+        die("[ERRORE] Nessun prodotto creato.", 2)
+    print(f"[FINE] Prodotti creati: {created}")
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="Percorso del CSV")
+    args = ap.parse_args()
+    if not os.path.exists(args.csv):
+        die(f"File non trovato: {args.csv}")
+    run(args.csv)
