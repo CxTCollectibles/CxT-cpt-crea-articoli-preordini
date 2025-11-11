@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 Import preordini su Wix Stores da CSV V7 (colonne minime: nome_articolo;prezzo_eur;sku).
-Colonne usate se presenti: descrizione;preorder_deadline;eta;brand;categoria
+Colonne opzionali usate se presenti: descrizione;preorder_deadline;eta;brand;categoria
 
-Cosa fa:
+Comportamento:
 - Risolve ID categorie via /collections/query.
-- Se SKU esiste: patch del prodotto (nome, descrizione, brand, prezzo, categorie, ribbon/tags)
-  e forzatura delle Product Options corrette.
-- Se SKU non esiste: crea il prodotto con Product Options corrette.
-- Imposta due varianti con prezzi:
-    ANTICIPO/SALDO = 30% del prezzo
-    PAGAMENTO ANTICIPATO = prezzo -5%, con compareAt al prezzo pieno
-- Aggiunge riga vuota fra intestazione (DEADLINE/ETA) e corpo descrizione.
-- Prova ad attivare flag preordine (best-effort).
+- Cerca per SKU (3 strategie + scan paginato). Se esiste: PATCH. Se non esiste: POST.
+- Se il POST fallisce con 'product.sku is not unique', ri-cerca e passa a PATCH.
+- Forza sempre le Product Options:
+    - PREORDER PAYMENTS OPTIONS*
+        - ANTICIPO/SALDO  (= 30% del prezzo base)
+        - PAGAMENTO ANTICIPATO (= 95% del prezzo base, compareAtPrice = prezzo base)
+- Descrizione con intestazione DEADLINE/ETA, poi riga vuota, poi corpo.
+- Aggiunge alla categoria (collection) se trovata.
+- Prova ad attivare il preorder.
 
-Env richieste: WIX_API_KEY, WIX_SITE_ID
-CSV: 1) argomento CLI, oppure 2) env CSV_PATH, oppure 3) percorsi noti.
+Richiede:
+  - Env: WIX_API_KEY, WIX_SITE_ID
+  - CSV path: argomento CLI oppure env CSV_PATH oppure file noti.
 """
 
 import os, sys, csv, json
@@ -72,20 +74,65 @@ def get_collections_map():
             break
     return out
 
-def query_product_by_sku(sku):
-    """Cerca 1 prodotto per SKU. Non blocca se la query è schizzinosa."""
+# ---------- product lookup by SKU ----------
+def query_product_by_sku_v1(sku):
+    # filtro "classico"
     url = f"{WIX_API}/products/query"
-    payloads = [
-        {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}},
-        {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}}
-    ]
-    for p in payloads:
-        r = requests.post(url, headers=HEADERS, data=json.dumps(p), timeout=30)
-        if r.ok:
-            items = r.json().get("products", [])
-            return items[0] if items else None
+    payload = {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}}
+    r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=20)
+    if r.ok:
+        items = r.json().get("products", [])
+        return items[0] if items else None
     return None
 
+def query_product_by_sku_v2(sku):
+    # alcuni ambienti accettano filter semplice
+    url = f"{WIX_API}/products/query"
+    payload = {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}}
+    r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=20)
+    if r.ok:
+        items = r.json().get("products", [])
+        return items[0] if items else None
+    return None
+
+def scan_products_find_sku(sku):
+    # fallback robusto: pagina tutta la lista e confronta client-side
+    url = f"{WIX_API}/products/query"
+    cursor = None
+    sku_norm = (sku or "").strip().lower()
+    while True:
+        payload = {"query": {"paging": {"limit": 100}}}
+        if cursor:
+            payload["query"]["paging"]["cursor"] = cursor
+        r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
+        if not r.ok:
+            break
+        data = r.json()
+        for p in data.get("products", []):
+            if (p.get("sku") or "").strip().lower() == sku_norm:
+                return p
+        cursor = data.get("paging", {}).get("nextCursor")
+        if not cursor:
+            break
+    return None
+
+def find_product_by_sku(sku):
+    # prova v1 -> v2 -> scan
+    try:
+        p = query_product_by_sku_v1(sku)
+        if p: return p
+    except Exception: pass
+    try:
+        p = query_product_by_sku_v2(sku)
+        if p: return p
+    except Exception: pass
+    try:
+        p = scan_products_find_sku(sku)
+        if p: return p
+    except Exception: pass
+    return None
+
+# ---------- description ----------
 def build_description(row):
     descr_raw = (row.get("descrizione") or "").strip()
     dl  = (row.get("preorder_deadline") or "").strip()
@@ -106,7 +153,7 @@ def build_description(row):
         return f"<p>{body_html}</p>"
     return ""
 
-# ---------- product creation / update ----------
+# ---------- constants for options ----------
 OPTION_NAME = "PREORDER PAYMENTS OPTIONS*"
 CHOICE_DEPOSIT = "ANTICIPO/SALDO"
 CHOICE_PREPAY  = "PAGAMENTO ANTICIPATO"
@@ -120,6 +167,7 @@ def options_payload():
         ]
     }]
 
+# ---------- create / patch ----------
 def create_product(row, collection_id=None):
     name = (row.get("nome_articolo") or "").strip()
     if len(name) > 80: name = name[:80]
@@ -149,7 +197,6 @@ def create_product(row, collection_id=None):
     return r.json().get("product", {}).get("id")
 
 def force_options(product_id):
-    """Forza le Product Options corrette sul prodotto esistente."""
     patch = {"product": {"id": product_id, "productOptions": options_payload()}}
     r = requests.patch(f"{WIX_API}/products/{product_id}", headers=HEADERS,
                        data=json.dumps(patch), timeout=30)
@@ -180,9 +227,7 @@ def patch_product_main(pid, row, price, collection_id):
     if not r.ok:
         raise RuntimeError(f"PATCH /products/{pid} failed {r.status_code}: {r.text}")
 
-# ---------- variants ----------
 def patch_variants(product_id, base_price, base_sku):
-    """Qui il fix: choices deve essere UN OGGETTO {optionName: choiceValue}."""
     deposit = round_price(base_price * 0.30)
     prepay  = round_price(base_price * 0.95)
 
@@ -245,9 +290,10 @@ def main():
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
         rd = csv.DictReader(fh, delimiter=";")
         required = {"nome_articolo", "prezzo_eur", "sku"}
-        if not rd.fieldnames or not required.issubset(set([c.strip() for c in rd.fieldnames])):
-            miss = required - set([c.strip() for c in (rd.fieldnames or [])])
-            print(f"[FATAL] CSV mancano colonne: {sorted(miss)}"); sys.exit(2)
+        headers_norm = { (h or "").strip(): h for h in (rd.fieldnames or []) }
+        if not rd.fieldnames or not required.issubset(set(headers_norm.keys())):
+            miss = sorted(list(required - set(headers_norm.keys())))
+            print(f"[FATAL] CSV mancano colonne: {miss}"); sys.exit(2)
 
         for i, row in enumerate(rd, start=2):
             name = (row.get("nome_articolo") or "").strip()
@@ -260,42 +306,55 @@ def main():
             except:
                 log(f"[SKIP] Riga {i}: prezzo non valido."); continue
 
+            # categoria
             cat_id = None
-            cat = (row.get("categoria") or "").strip().lower()
-            if cat and col_map:
-                cat_id = col_map.get(cat) or next((v for k, v in col_map.items()
-                         if k.replace(" ", "") == cat.replace(" ", "")), None)
+            raw_cat = (row.get("categoria") or "").strip().lower()
+            if raw_cat and col_map:
+                cat_id = col_map.get(raw_cat) or next(
+                    (v for k, v in col_map.items()
+                     if k.replace(" ", "") == raw_cat.replace(" ", "")), None
+                )
                 if not cat_id:
                     log(f"[WARN] Categoria '{row.get('categoria')}' non trovata.")
 
-            existing = None
-            try:
-                existing = query_product_by_sku(sku)
-            except Exception as e:
-                log(f"[WARN] Query SKU fallita: {e}")
+            # lookup SKU
+            existing = find_product_by_sku(sku)
+
+            def do_update(pid):
+                patch_product_main(pid, row, price, cat_id)
+                force_options(pid)
+                patch_variants(pid, price, sku)
+                try_enable_preorder(pid)
+                add_to_collections(pid, cat_id)
 
             try:
                 if existing:
                     pid = existing["id"]
-                    # patch main fields + categorie
-                    patch_product_main(pid, row, price, cat_id)
-                    # forzo le opzioni corrette, poi varianti
-                    force_options(pid)
-                    patch_variants(pid, price, sku)
-                    try_enable_preorder(pid)
-                    add_to_collections(pid, cat_id)
+                    do_update(pid)
                     updated += 1
                     log(f"[OK] Aggiornato: {name}")
                 else:
-                    pid = create_product(row, collection_id=cat_id)
-                    if not pid:
-                        raise RuntimeError("ID prodotto non ricevuto.")
-                    # varianti e resto
-                    patch_variants(pid, price, sku)
-                    try_enable_preorder(pid)
-                    add_to_collections(pid, cat_id)
-                    created += 1
-                    log(f"[OK] Creato: {name}")
+                    try:
+                        pid = create_product(row, collection_id=cat_id)
+                    except RuntimeError as e:
+                        msg = str(e)
+                        if "sku is not unique" in msg.lower():
+                            # qualcuno l’ha già creato: trova e patcha
+                            found = find_product_by_sku(sku)
+                            if not found:
+                                raise
+                            pid = found["id"]
+                            do_update(pid)
+                            updated += 1
+                            log(f"[OK] Aggiornato (da duplicate SKU): {name}")
+                        else:
+                            raise
+                    else:
+                        patch_variants(pid, price, sku)
+                        try_enable_preorder(pid)
+                        add_to_collections(pid, cat_id)
+                        created += 1
+                        log(f"[OK] Creato: {name}")
             except Exception as e:
                 log(f"[ERRORE] Riga {i} '{name}': {e}")
 
