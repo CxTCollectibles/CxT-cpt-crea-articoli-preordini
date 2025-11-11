@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, csv, re, json, time, argparse, math, unicodedata
-from datetime import datetime
+import os, sys, csv, re, json, argparse, unicodedata
 from typing import Dict, Any, List, Optional
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- Config base ----------
+# ---------- Config ----------
 API_KEY = os.environ.get("WIX_API_KEY", "").strip()
 SITE_ID = os.environ.get("WIX_SITE_ID", "").strip()
 BASE = "https://www.wixapis.com"
@@ -25,78 +24,31 @@ HEADERS_R = {
 OPTION_TITLE = "PREORDER PAYMENTS OPTIONS*"
 CHOICE_AS = "ANTICIPO/SALDO"
 CHOICE_PA = "PAGAMENTO ANTICIPATO"
+NAME_MAX = 80  # limite Wix
 
-# Limite nome Wix: max 80
-# ref: Product Object name maxLength 80
-# https://dev.wix.com/docs/api-reference/business-solutions/stores/catalog/product-object
-NAME_MAX = 80
-
-# ---------- Utility ----------
+# ---------- Utils ----------
 def log(s): print(s, flush=True)
 
 def slugify(text):
     text = unicodedata.normalize("NFKD", text)
     text = "".join([c for c in text if not unicodedata.combining(c)])
-    text = re.sub(r"[^a-zA-Z0-9]+","-", text).strip("-").lower()
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return text[:100] or "item"
 
 def money2(x: float) -> float:
     return round(float(x)+1e-8, 2)
 
 def parse_price(txt: str) -> float:
-    if txt is None: return 0.0
+    if not txt: return 0.0
     t = txt.strip().replace("€","").replace(",",".")
     m = re.search(r"(\d+(?:\.\d+)?)", t)
     return float(m.group(1)) if m else 0.0
-
-def quarter_from_date(dt: datetime) -> str:
-    q = (dt.month-1)//3 + 1
-    return f"Q{q}"
-
-def month_to_quarter_token(s: str) -> Optional[int]:
-    s = s.lower()
-    months = {
-        "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-        "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
-        "gennaio":1,"febbraio":2,"marzo":3,"aprile":4,"maggio":5,"giugno":6,
-        "luglio":7,"agosto":8,"settembre":9,"ottobre":10,"novembre":11,"dicembre":12,
-        "januar":1,"februar":2,"märz":3,"maerz":3,"april":4,"mai":5,"juni":6,
-        "juli":7,"august":8,"september":9,"oktober":10,"november":11,"dezember":12,
-        "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-        "julio":7,"agosto":8,"septiembre":9,"octubre":10,"noviembre":11,"diciembre":12,
-        "août":8,"aout":8,"janvier":1,"février":2,"fevrier":2,"mars":3,"avril":4,"mai":5,"juin":6,"juillet":7,"septembre":9,"octobre":10,"novembre":11,"décembre":12,"decembre":12
-    }
-    return months.get(s)
-
-def extract_eta_quarter(eta_raw: str) -> Optional[str]:
-    if not eta_raw: return None
-    # prova dd/mm/yyyy o mm/yyyy
-    m = re.search(r"(\d{1,2})[\/\.\-](\d{4})", eta_raw)
-    if m:
-        # mese/anno
-        mon = int(m.group(1)); yr = int(m.group(2))
-        q = (mon-1)//3 + 1
-        next_q = q+1 if q<4 else 1
-        next_yr = yr if q<4 else yr+1
-        return f"Q{q}–Q{next_q} {yr if q<4 else f'{yr}-{next_yr}'}"
-    # prova "Agosto 2026", "August 2026", ecc.
-    m = re.search(r"([A-Za-zÀ-ÿ]+)\s+(\d{4})", eta_raw)
-    if m:
-        mon_txt = m.group(1); yr = int(m.group(2))
-        mon = month_to_quarter_token(mon_txt) or 0
-        if mon:
-            q = (mon-1)//3 + 1
-            next_q = q+1 if q<4 else 1
-            next_yr = yr if q<4 else yr+1
-            return f"Q{q}–Q{next_q} {yr if q<4 else f'{yr}-{next_yr}'}"
-    return None
 
 def normalize_whitespace(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 # ---------- HTTP ----------
-def req_json(method: str, url: str, headers: Dict[str,str], body: Optional[Dict]=None) -> (int, Dict):
-    data = None
+def req_json(method: str, url: str, headers: Dict[str,str], body: Optional[Dict]=None):
     try:
         if method == "GET":
             r = requests.get(url, headers=headers, timeout=30)
@@ -116,8 +68,7 @@ def req_json(method: str, url: str, headers: Dict[str,str], body: Optional[Dict]
         return 0, {"error": str(e)}
 
 # ---------- CSV ----------
-def sniff_csv(csv_path: str) -> (str, str):
-    # Di default ; e utf-8-sig per i file Excel esportati
+def sniff_csv(csv_path: str):  # Excel -> ; + utf-8-sig
     return "utf-8-sig", ";"
 
 def read_rows(csv_path: str) -> List[Dict[str,str]]:
@@ -127,7 +78,6 @@ def read_rows(csv_path: str) -> List[Dict[str,str]]:
     with open(csv_path, "r", encoding=enc, newline="") as f:
         rdr = csv.DictReader(f, delimiter=delim)
         for r in rdr:
-            # normalizza chiavi
             rr = { (k or "").strip().lower(): (v or "").strip() for k,v in r.items() }
             rows.append(rr)
     return rows
@@ -151,8 +101,7 @@ def find_collection_id_by_name(name: str) -> Optional[str]:
     return None
 
 def add_product_to_collection(col_id: str, product_id: str) -> bool:
-    # endpoint corretto:
-    # POST https://www.wixapis.com/stores/v1/collections/{id}/productIds
+    # API corretta: aggiunge IDs alla collection
     url = f"{BASE}/stores/v1/collections/{col_id}/productIds"
     body = {"ids": [product_id]}
     code, data = req_json("POST", url, HEADERS_RW, body)
@@ -166,14 +115,12 @@ def fetch_description_from_url(url: str) -> str:
             return ""
         soup = BeautifulSoup(r.text, "lxml")
 
-        # 1) prova meta description
         meta = soup.find("meta", attrs={"name":"description"})
         if meta and meta.get("content"):
             md = normalize_whitespace(meta["content"])
             if 40 <= len(md) <= 5000:
                 return md
 
-        # 2) prova blocchi testuali ricorrenti
         candidates = []
         for sel in [
             "div.product-description","div#product-description","section.description","div#description",
@@ -185,11 +132,9 @@ def fetch_description_from_url(url: str) -> str:
                 if len(txt) > 60:
                     candidates.append(txt)
         if candidates:
-            # prendi il più lungo “sensato”
             candidates.sort(key=len, reverse=True)
             return candidates[0][:5000]
 
-        # 3) prendi un paragrafo corposo
         ps = soup.find_all(["p","div"])
         best = ""
         for el in ps:
@@ -200,61 +145,53 @@ def fetch_description_from_url(url: str) -> str:
     except Exception:
         return ""
 
-def build_description(block_above: str, raw: str) -> str:
-    # Componi: testatina + testo
+def build_description(hdr: str, raw: str) -> str:
     parts = []
-    if block_above:
-        parts.append(block_above)
-    if raw:
-        parts.append(raw)
+    if hdr: parts.append(hdr)
+    if raw: parts.append(raw)
     body = "\n\n".join(parts).strip()
-    if not body:
-        return ""
-    # niente backslash in f-string: costruisco semplice HTML
-    body_html = "<div><p>" + body.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\n","<br>") + "</p></div>"
-    return body_html
+    if not body: return ""
+    body = body.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\n","<br>")
+    return "<div><p>" + body + "</p></div>"
 
-# ---------- Creazione & Varianti ----------
-def create_product(payload: Dict[str,Any]) -> Optional[str]:
+# ---------- Create/Patch ----------
+def create_product(product_payload: Dict[str,Any]) -> Optional[str]:
+    # Wix vuole il wrapper {"product": {...}}
     url = f"{BASE}/stores/v1/products"
-    code, data = req_json("POST", url, HEADERS_RW, payload)
+    code, data = req_json("POST", url, HEADERS_RW, {"product": product_payload})
     if code == 200 and data.get("product",{}).get("id"):
         return data["product"]["id"]
-    # fallback: magari alcune proprietà non sono permesse in create
     return None
 
 def patch_product(product_id: str, patch: Dict[str,Any]) -> bool:
     url = f"{BASE}/stores/v1/products/{product_id}"
-    code, data = req_json("PATCH", url, HEADERS_RW, patch)
+    code, _ = req_json("PATCH", url, HEADERS_RW, {"product": patch})
     return code == 200
 
 def set_variants(product_id: str, variants: List[Dict[str,Any]]) -> bool:
-    # Aggiorna l'intera lista varianti
     url = f"{BASE}/stores/v1/products/{product_id}/variants"
-    body = {"variants": variants}
-    code, data = req_json("PATCH", url, HEADERS_RW, body)
+    code, _ = req_json("PATCH", url, HEADERS_RW, {"variants": variants})
     return code == 200
 
-# ---------- Main run ----------
+# ---------- Main ----------
 def run(csv_path: str):
     if not API_KEY or not SITE_ID:
         log("[ERRORE] WIX_API_KEY o WIX_SITE_ID mancanti nei secrets.")
         sys.exit(2)
 
-    # precheck lettura prodotti per permessi
+    # precheck lettura (permessi)
     code, data = req_json("POST", f"{BASE}/stores-reader/v1/products/query", HEADERS_R, {"query":{"paging":{"limit":5}}})
     if code != 200:
         log(f"[ERRORE] PRECHECK fallito: {code} {json.dumps(data)}")
         sys.exit(2)
-    vis = len(data.get("products",[]))
-    log(f"[PRECHECK] API ok. Prodotti visibili: {vis}")
+    log(f"[PRECHECK] API ok. Prodotti visibili: {len(data.get('products',[]))}")
 
     rows = read_rows(csv_path)
     if not rows:
         log("[ERRORE] CSV vuoto o non valido.")
         sys.exit(2)
 
-    # stampa collezioni disponibili (una volta per log utili)
+    # info collections (aiuta a verificare i nomi)
     cols = list_collections()
     if cols:
         names = ", ".join([c.get("name","") for c in cols][:20])
@@ -275,100 +212,86 @@ def run(csv_path: str):
         sku = r.get("sku") or r.get("codice prodotto") or r.get("codice") or ""
         gtin = r.get("gtin") or r.get("ean") or ""
         peso = parse_price(r.get("peso") or r.get("peso_grammi") or "0")
-
-        # categoria dal CSV
         categoria_csv = r.get("categoria") or r.get("collection") or r.get("categoria wix") or ""
-        # URL sorgente distributore
+
         url_sorg = r.get("link al sito del produttore") or r.get("url_prodotto") or r.get("url") or ""
         descr_csv = r.get("descrizione") or ""
-
-        # ETA e Deadline (più tolleranza nomi)
         deadline_csv = r.get("deadline") or r.get("scadenza") or r.get("data scadenza") or r.get("chiusura preordine") or ""
         eta_csv = r.get("eta") or r.get("uscita prevista") or r.get("release") or r.get("data uscita") or ""
 
         log(f"[WORK] Riga {i}: {name}")
 
         # Nome <= 80
-        name80 = name[:NAME_MAX]
         if len(name) > NAME_MAX:
             log(f"[WARN] Nome > {NAME_MAX} caratteri, troncato.")
+        name80 = name[:NAME_MAX]
 
-        # Header descrizione (ETA/Deadline)
-        eta_token = extract_eta_quarter(eta_csv or "")
+        # Header (ETA/Deadline) in descrizione
         hdr_parts = []
-        if deadline_csv:
-            hdr_parts.append(f"Preorder closes: {deadline_csv}")
-        if eta_token:
-            hdr_parts.append(f"ETA: {eta_token}")
+        if deadline_csv: hdr_parts.append(f"Preorder closes: {deadline_csv}")
+        if eta_csv:      hdr_parts.append(f"ETA: {eta_csv}")
         hdr = " — ".join(hdr_parts)
 
-        # Descrizione
-        raw_descr = descr_csv.strip()
+        raw_descr = (descr_csv or "").strip()
         if not raw_descr and url_sorg:
             raw_descr = fetch_description_from_url(url_sorg).strip()
-
         desc_html = build_description(hdr, raw_descr)
 
-        # Calcolo varianti
+        # Varianti prezzo
         anticipo = money2(price * 0.30)
         anticipato = money2(price * 0.95)
 
-        # Payload base
-        slug = slugify(name80 if not sku else f"{name80}-{sku}".strip())
-        payload = {
+        slug = slugify(name80 if not sku else f"{name80}-{sku}")
+        product = {
             "name": name80,
             "slug": slug,
             "visible": True,
             "productType": "physical",
             "description": desc_html,
             "priceData": {"price": money2(price)},
-            "ribbon": "PREORDER" if is_preorder else "",
+            "ribbon": "PREORDER" if is_preorder else ""
         }
-        if sku:
-            payload["sku"] = sku
-        if gtin:
-            payload["gtin"] = gtin
-        if peso > 0:
-            payload["weight"] = peso
+        if sku:  product["sku"] = sku
+        if gtin: product["gtin"] = gtin
+        if peso > 0: product["weight"] = peso
 
-        # Opzioni + Varianti già con prezzi
-        payload["productOptions"] = [{
+        # Opzione + varianti (già in create)
+        product["productOptions"] = [{
             "name": OPTION_TITLE,
             "choices": [
                 {"value": CHOICE_AS, "description": "Paga 30% ora, saldo alla disponibilità"},
                 {"value": CHOICE_PA, "description": "Pagamento immediato con sconto 5%"}
             ]
         }]
-        payload["manageVariants"] = True
-        payload["variants"] = [
+        product["manageVariants"] = True
+        product["variants"] = [
             {"choices": {OPTION_TITLE: CHOICE_AS}, "priceData": {"price": anticipo}, "visible": True},
             {"choices": {OPTION_TITLE: CHOICE_PA}, "priceData": {"price": anticipato}, "visible": True}
         ]
 
-        # Crea prodotto
-        pid = create_product(payload)
+        pid = create_product(product)
 
-        # Se non accetta le varianti in create, ritenta senza varianti e poi patch
+        # fallback: crea senza varianti, poi patcha opzioni e varianti
         if not pid:
-            # prova create minimale
-            minimal = payload.copy()
-            minimal.pop("variants", None)
-            minimal.pop("manageVariants", None)
-            code, data = req_json("POST", f"{BASE}/stores/v1/products", HEADERS_RW, minimal)
+            minimal = {k:v for k,v in product.items() if k not in ("productOptions","manageVariants","variants")}
+            code, data = req_json("POST", f"{BASE}/stores/v1/products", HEADERS_RW, {"product": minimal})
             if code == 200 and data.get("product",{}).get("id"):
                 pid = data["product"]["id"]
-                # ora set varianti
-                okv = set_variants(pid, [
-                    {"choices": {OPTION_TITLE: CHOICE_AS}, "priceData": {"price": anticipo}, "visible": True},
-                    {"choices": {OPTION_TITLE: CHOICE_PA}, "priceData": {"price": anticipato}, "visible": True}
-                ])
-                if not okv:
-                    log(f"[WARN] Varianti non aggiornate via PATCH per '{name80}'.")
+                # patch opzioni
+                patch_ok = patch_product(pid, {
+                    "productOptions": product["productOptions"],
+                    "manageVariants": True
+                })
+                # set varianti
+                var_ok = set_variants(pid, product["variants"])
+                if not (patch_ok and var_ok):
+                    log(f"[WARN] Varianti/opzioni non applicate completamente per '{name80}'.")
             else:
                 log(f"[ERRORE] Riga {i} '{name80}': POST /products failed {code}: {json.dumps(data)}")
                 continue
 
-        # Categoria
+        # Brand: se vuoi, mappa su ribbon/description. Campo Brand nativo via REST non sempre è esposto.
+        # Assegna categoria se presente
         if categoria_csv:
             col_id = find_collection_id_by_name(categoria_csv)
             if col_id:
