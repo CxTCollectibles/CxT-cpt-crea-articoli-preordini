@@ -5,7 +5,11 @@ import os, sys, csv, re, json, time, html
 from datetime import datetime
 from urllib.parse import urlparse
 import requests
-from bs4 import BeautifulSoup
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None  # verrà installato dal workflow
 
 # ====== SECRETS ======
 WIX_API_KEY = os.environ.get("WIX_API_KEY")
@@ -46,11 +50,9 @@ def clean_text(t):
     return t.strip()
 
 def quarter_from_date_or_text(eta_text):
-    """ 'FINE 08/2026' o 'Aug 2026' o '2026-08' -> ('Q3 - Q4', datetime) """
     if not eta_text:
         return None, None
     t = eta_text.strip()
-    # mm/yyyy
     m = re.search(r"(\d{1,2})/(\d{4})", t)
     month = None; year = None
     if m:
@@ -81,7 +83,7 @@ def prepend_eta_deadline(desc, eta_text, deadline_text):
         return banner + (desc or "")
     return desc
 
-# ====== SCRAPING GENERICO + ALCUNI DOMINI ======
+# ====== SCRAPING ======
 
 SKU_PATTERNS = r"(Codice Prodotto|Codice articolo|Artikelnummer|SKU)\s*[:#]?\s*([A-Z0-9\-_.]{4,})"
 GTIN_PATTERNS = r"(GTIN|EAN|UPC)\s*[:#]?\s*(\d{8,14})"
@@ -117,6 +119,8 @@ def longest_text_from(container):
     return "\n".join(chunks)
 
 def scrape_generic(url):
+    if not BeautifulSoup:
+        return {}  # se bs4 manca, saltiamo scraping (workflow lo installerà)
     r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -125,18 +129,15 @@ def scrape_generic(url):
     ld = extract_ld_json(soup)
     out.update({k:v for k,v in ld.items() if v})
 
-    # fallback description
     if not out.get("description"):
         og = soup.find("meta", {"property":"og:description"}) or soup.find("meta", {"name":"description"})
         if og and og.get("content"): out["description"] = og["content"]
-    # se ancora poco, prendi il blocco più ricco
     if not out.get("description") or len(out["description"]) < 200:
         main = soup.select_one("main") or soup.select_one("#content") or soup
         cand = longest_text_from(main)
         if len(cand) > len(out.get("description","")):
             out["description"] = cand
 
-    # estrazioni testuali generiche
     full_txt = soup.get_text(" ", strip=True)
 
     msku = re.search(SKU_PATTERNS, full_txt, re.I)
@@ -151,20 +152,15 @@ def scrape_generic(url):
     me = re.search(ETA_PATTERNS, full_txt, re.I)
     if me: out.setdefault("eta", me.group(2))
 
-    # HEO: affinamenti
     host = urlparse(url).netloc
     if "heo.com" in host:
-        # descrizione centrale (meglio del generico)
         center = soup.select_one("#content") or soup
         cand = longest_text_from(center)
         if len(cand) > len(out.get("description","")):
             out["description"] = cand
-
-        # badge ETA arancione spesso contiene 'ETA: FINE 08/2026'
         m = re.search(r"ETA[:\s]+([A-Za-z]{3,}\s*\d{4}|\d{2}/\d{4}|FINE\s*\d{2}/\d{4})", full_txt, re.I)
         if m: out["eta"] = m.group(1).strip()
 
-    # Sideshow: il JSON-LD di solito basta, altrimenti itemprop=description
     if "sideshow" in host:
         if not out.get("description"):
             d = soup.select_one("[itemprop='description']")
@@ -187,15 +183,12 @@ def wix_list_collections():
 def best_collection_id_by_name(wanted):
     wanted_n = wanted.strip().casefold()
     items = wix_list_collections()
-    # match esatto casefold
     for it in items:
         if it.get("name","").casefold() == wanted_n:
             return it["id"]
-    # match parziale
     for it in items:
         if wanted_n in it.get("name","").casefold():
             return it["id"]
-    # niente
     return None
 
 def create_wix_product(payload):
@@ -220,18 +213,22 @@ def build_payload(row, scraped):
         except: pass
 
     descr = clean_text(row.get("descrizione") or scraped.get("description") or "")
-    # limitiamo per sicurezza
     if len(descr) > 8000: descr = descr[:8000]
 
     eta  = row.get("eta_raw") or scraped.get("eta")
     ddl  = row.get("deadline_raw") or scraped.get("deadline")
     descr_final = prepend_eta_deadline(descr, eta, ddl)
 
+    # PREPARA HTML DESCRIZIONE (fix: niente backslash in f-string)
+    if descr_final:
+        desc_html = "<div><p>" + descr_final.replace("\n", "<br>") + "</p></div>"
+    else:
+        desc_html = ""
+
     # varianti con prezzo
     prezzo_anticipo = money(price * 0.30)
     prezzo_prepag   = money(price * 0.95)
 
-    # collection
     col_id = None
     cat = (row.get("categoria") or "").strip()
     if cat:
@@ -243,7 +240,7 @@ def build_payload(row, scraped):
         "name": name,
         "slug": f"{slugify(name)}-{sku.lower()}",
         "productType": "physical",
-        "description": f"<div><p>{descr_final.replace('\n','<br>')}</p></div>" if descr_final else "",
+        "description": desc_html,
         "priceData": { "currency": "EUR", "price": price },
         "manageVariants": True,
         "productOptions": [{
@@ -278,7 +275,7 @@ def build_payload(row, scraped):
         payload["physicalProperties"] = { "weight": { "value": weight, "unit": "kg" } }
 
     if brand:
-        payload["brand"] = brand  # campo avanzato brand, se esposto nel tuo tema
+        payload["brand"] = brand
 
     if gtin:
         payload.setdefault("seoData", {})
@@ -319,7 +316,7 @@ def run(csv_path):
 
         scraped = {}
         url = (row.get("url_produttore") or "").strip()
-        if url:
+        if url and BeautifulSoup:
             try:
                 scraped = scrape_generic(url)
             except Exception as e:
