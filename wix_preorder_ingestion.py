@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Ingestione preordini su Wix Stores partendo dal CSV V7 dell'utente.
-- Usa campi dal CSV: nome_articolo, prezzo_eur, sku, descrizione, preorder_deadline, eta, brand, categoria
-- Categorie mappate per nome -> ID (POST /collections/query)
-- Opzione + Varianti:
-  * Opzione: PREORDER PAYMENTS OPTIONS*
-  * Scelte:  ANTICIPO/SALDO (30% del prezzo)
-             PAGAMENTO ANTICIPATO (prezzo -5%, compareAt = prezzo pieno)
-- Descrizione: HEAD (PREORDER DEADLINE, ETA) + riga vuota + corpo
-- Brand impostato se presente
-- Tentativo di abilitare flag preordine (best-effort)
+Ingestione preordini su Wix Stores partendo dal CSV V7 fornito dall'utente.
+Campi usati dal CSV: nome_articolo; prezzo_eur; sku; descrizione; preorder_deadline; eta; brand; categoria
 
-Richiede env:
-  WIX_API_KEY
-  WIX_SITE_ID
-Facoltativo:
-  CSV_PATH  -> percorso al CSV; altrimenti auto-rilevamento
+Comportamento:
+- Categorie risolte via POST /collections/query
+- Creazione/aggiornamento prodotto:
+  productType=physical, brand, ribbon PREORDER, tag PREORDER
+  description = intestazione (PREORDER DEADLINE, ETA) + riga vuota + corpo descrizione
+- Opzione + varianti:
+  Opzione: PREORDER PAYMENTS OPTIONS*
+  Scelte:  ANTICIPO/SALDO (30% del prezzo)
+           PAGAMENTO ANTICIPATO (prezzo -5%, compareAt = prezzo pieno)
+- Prova ad abilitare il flag preordine (best-effort)
+- Evita duplicati cercando per SKU (se query SKU fallisce, procede comunque)
+
+Env richieste:
+  WIX_API_KEY, WIX_SITE_ID
+Facoltativa:
+  CSV_PATH (percorso CSV); altrimenti prova percorsi comuni o argv[1]
 """
 
 import os, sys, csv, json
@@ -31,13 +34,13 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def log(*a): print(*a, flush=True)
+def log(*a): 
+    print(*a, flush=True)
 
 def round_price(x):
     return float(f"{x:.2f}")
 
 def resolve_csv_path():
-    # Priorità: argv, env, poi percorsi comuni
     candidates = []
     if len(sys.argv) > 1 and sys.argv[1].strip():
         candidates.append(sys.argv[1].strip())
@@ -55,10 +58,7 @@ def resolve_csv_path():
     raise FileNotFoundError(f"CSV non trovato. Provati: {candidates}")
 
 def get_collections_map():
-    """
-    Ritorna {nome_lower: id} usando POST /collections/query
-    Gestisce paging (max 100 per pagina).
-    """
+    """Ritorna {nome_lower: id} usando POST /collections/query + paging."""
     url = f"{WIX_API}/collections/query"
     collections = {}
     cursor = None
@@ -81,12 +81,20 @@ def get_collections_map():
     return collections
 
 def query_product_by_sku(sku):
+    """Cerca un prodotto per SKU. Se Wix si lamenta, restituisce None."""
     url = f"{WIX_API}/products/query"
-    payload = {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 50}}}
-    r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
-    r.raise_for_status()
-    items = r.json().get("products", [])
-    return items[0] if items else None
+    # Alcune istanze accettano {"sku":{"$eq":sku}}, altre vogliono il valore diretto.
+    payloads = [
+        {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}},
+        {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}},
+    ]
+    for payload in payloads:
+        r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
+        if r.ok:
+            items = r.json().get("products", [])
+            return items[0] if items else None
+    # se entrambe falliscono, non blocchiamo il flusso (torna None)
+    return None
 
 def build_description(row):
     descr_raw = (row.get("descrizione") or "").strip()
@@ -101,6 +109,7 @@ def build_description(row):
     body_html = (descr_raw.replace("\n", "<br>") if descr_raw else "").strip()
 
     if head_html and body_html:
+        # riga vuota fra testa e corpo
         return f"<p>{head_html}</p><p><br></p><p>{body_html}</p>"
     elif head_html:
         return f"<p>{head_html}</p>"
@@ -119,7 +128,7 @@ def create_product(row, collection_id=None):
     product_obj = {
         "name": name,
         "sku": sku,
-        "productType": "PHYSICAL",
+        "productType": "physical",  # lowercase, o Wix piange
         "priceData": {"price": round_price(price)},
         "description": build_description(row),
         "brand": brand if brand else None,
@@ -129,8 +138,8 @@ def create_product(row, collection_id=None):
         "productOptions": [{
             "name": "PREORDER PAYMENTS OPTIONS*",
             "choices": [
-                {"value": "ANTICIPO/SALDO"},
-                {"value": "PAGAMENTO ANTICIPATO"}
+                {"value": "ANTICIPO/SALDO", "description": "ANTICIPO/SALDO"},
+                {"value": "PAGAMENTO ANTICIPATO", "description": "PAGAMENTO ANTICIPATO"}
             ]
         }]
     }
@@ -166,6 +175,7 @@ def patch_variants(product_id, base_price, base_sku):
         raise RuntimeError(f"PATCH /products/{product_id}/variants failed {r.status_code}: {r.text}")
 
 def try_enable_preorder(product_id):
+    """Best-effort su diverse proprietà viste in natura."""
     url = f"{WIX_API}/products/{product_id}"
     candidates = [
         {"product": {"isPreOrder": True}},
@@ -184,6 +194,7 @@ def add_to_collections(product_id, collection_id):
     url = f"{WIX_API}/collections/{collection_id}/products/add"
     payload = {"productIds": [product_id]}
     r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
+    # se non va, non bloccare
     if not r.ok:
         log(f"[WARN] add_to_collections ignorato: {r.status_code}")
 
@@ -193,6 +204,7 @@ def main():
         sys.exit(2)
 
     log("[PRECHECK] API ok. Inizio…")
+
     # Categorie
     try:
         col_map = get_collections_map()
@@ -228,22 +240,23 @@ def main():
                 log(f"[SKIP] Riga {i}: prezzo non valido.")
                 continue
 
+            # categoria
             cat_id = None
             cat_name = (row.get("categoria") or "").strip().lower()
             if cat_name and col_map:
                 cat_id = col_map.get(cat_name)
                 if not cat_id:
-                    # match senza spazi
                     cat_id = next((v for k, v in col_map.items()
                                    if k.replace(" ", "") == cat_name.replace(" ", "")), None)
                     if not cat_id:
                         log(f"[WARN] Categoria '{row.get('categoria')}' non trovata.")
 
+            # cerca esistente per SKU
+            existing = None
             try:
                 existing = query_product_by_sku(sku)
             except Exception as e:
                 log(f"[WARN] Query SKU fallita: {e}")
-                existing = None
 
             try:
                 if existing:
