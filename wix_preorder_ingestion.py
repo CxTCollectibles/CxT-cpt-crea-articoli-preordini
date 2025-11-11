@@ -52,6 +52,7 @@ def money(x):
     return round(max(0.0, v), 2)
 
 def limit_len(s, n):
+    s = s or ""
     return s if len(s) <= n else s[:n]
 
 def to_html(p):
@@ -109,6 +110,23 @@ GTIN_PAT = r"(GTIN|EAN|UPC)\s*[:#]?\s*(\d{8,14})"
 DDL_PAT  = r"(Deadline|Scadenza|Order Deadline|Preorder deadline)\s*[:#]?\s*([0-3]?\d\.[01]?\d\.\d{4})"
 ETA_PAT  = r"(ETA|Uscita prevista|Release|Disponibile da)\s*[:#]?\s*([A-Za-z]{3,}\s*\d{4}|\d{2}/\d{4}|FINE\s*\d{2}/\d{4})"
 
+STOP_WORDS = [
+    "accedi","registrazione","condizioni di vendita","faq","filtra prodotti","cerca prodotto",
+    "brand ","produttore","home page","trustpilot","p.iva","privacy","cookie","carrello"
+]
+
+def clean_desc(txt):
+    if not txt: return ""
+    # togli sporcizia di navigazione tipica
+    low = txt.lower()
+    for w in STOP_WORDS:
+        if w in low:
+            low = low.replace(w, " ")
+    # normalizza spazi
+    low = re.sub(r"\s+", " ", low).strip()
+    # ricostruisci frase con maiuscole come l'originale dove possibile
+    return low
+
 def scrape_all(url):
     out = {"description":"", "eta":None, "deadline":None, "sku":None, "gtin":None}
     if not url: return out
@@ -132,18 +150,23 @@ def scrape_all(url):
                     out["gtin"] = out["gtin"] or obj.get("gtin13") or obj.get("gtin") or obj.get("gtin14") or obj.get("gtin8")
             pick(j)
 
-        # fallback desc
+        # meta description
         if not out["description"]:
             meta = soup.select_one('meta[property="og:description"]') or soup.select_one('meta[name="description"]')
             if meta and meta.get("content"): out["description"] = meta["content"]
 
-        # fallback lungo
-        if not out["description"] or len(out["description"]) < 200:
-            txts = [t.get_text(" ", strip=True) for t in soup.select("main, #content, article, .product, .description, div, section, p")]
-            txts = [t for t in txts if len(t) > 120]
-            txts.sort(key=len, reverse=True)
-            if txts: out["description"] = txts[0]
+        # fallback corposo ma ripulito
+        if not out["description"] or len(out["description"]) < 120:
+            candidates = []
+            for sel in ["main", "#content", "article", ".product", ".product-details", ".description", "section"]:
+                for node in soup.select(sel):
+                    txt = node.get_text(" ", strip=True)
+                    if txt: candidates.append(txt)
+            candidates.sort(key=len, reverse=True)
+            if candidates:
+                out["description"] = candidates[0]
 
+        # estrazioni supplementari dal full text
         full = soup.get_text(" ", strip=True)
         m = re.search(SKU_PAT, full, re.I)
         if m: out["sku"] = out["sku"] or m.group(2)
@@ -156,7 +179,9 @@ def scrape_all(url):
 
     except Exception as e:
         print(f"[WARN] Scrape fallito: {e}")
-    out["description"] = (out["description"] or "").strip()
+    out["description"] = clean_desc(out["description"] or "").strip()
+    # taglia a massimo sensato per traduzione
+    out["description"] = limit_len(out["description"], 4000)
     return out
 
 # ---------------- TRANSLATE ----------------
@@ -170,14 +195,17 @@ def ensure_english(text):
     if lang.startswith("en"):
         return text
     try:
-        # MyMemory vuole i nomi lingua, non 'it'/'en'
         src = "italian" if lang.startswith("it") else "auto"
         trans = MyMemoryTranslator(source=src, target="english")
-        chunks, s = [], text
+        out_parts = []
+        s = text
+        # chunk massimo 450 char per limiti MyMemory
         while s:
-            chunk = s[:1800]; s = s[1800:]
-            chunks.append(trans.translate(chunk))
-        return "\n".join(chunks)
+            chunk = s[:450]
+            s = s[450:]
+            out_parts.append(trans.translate(chunk))
+            time.sleep(0.2)
+        return "\n".join(out_parts)
     except Exception as e:
         print(f"[WARN] Traduzione saltata ({e}); mantengo lingua originale.")
         return text
@@ -215,7 +243,10 @@ def find_collection_best(name):
 def add_product_to_collection(product_id, collection_id):
     if not collection_id: return
     url = f"{BASE_V1}/collections/{collection_id}/products/add"
-    http("POST", url, {"productIds": [product_id]})
+    try:
+        http("POST", url, {"productIds": [product_id]})
+    except Exception as e:
+        print(f"[WARN] Impossibile aggiungere alla collection {collection_id}: {e}")
 
 # ---------------- DEDUP ----------------
 def query_products_page(limit=50, cursor=None):
@@ -307,7 +338,7 @@ def patch_product_v1(product_id, product):
     url = f"{BASE_V1}/products/{product_id}"
     http("PATCH", url, {"product": product})
 
-# ---- Variants helpers: leggi e patcha per variantId ----
+# ---- Variants helpers ----
 def get_product_detail(product_id):
     url = f"{BASE_V1}/products/{product_id}"
     try:
@@ -316,16 +347,8 @@ def get_product_detail(product_id):
         print(f"[WARN] GET product detail fallita: {e}")
         return {}
 
-def normalize_choice(s):
-    # ignora maiuscole, slash, asterischi e spazi
-    s = (s or "").strip().lower()
-    s = s.replace("*","").replace("/","/").replace("  "," ")
-    return s
-
 def find_variant_ids(detail):
-    """Ritorna dict: {'anticipo_saldo': variantId, 'pagamento_anticipato': variantId} cercando per scelte reali."""
     ids = {"anticipo_saldo": None, "pagamento_anticipato": None}
-    # le varianti possono stare in detail['product']['variants'] oppure top-level 'variants'
     variants = []
     if isinstance(detail, dict):
         if isinstance(detail.get("product"), dict):
@@ -333,7 +356,6 @@ def find_variant_ids(detail):
         variants = variants or detail.get("variants") or []
     for v in variants:
         ch = v.get("choices") or {}
-        # trova la key dell'opzione preorder a prescindere dal nome esatto
         key = None
         for k in ch.keys():
             if "preorder" in norm(k) or "payments" in norm(k):
@@ -349,14 +371,12 @@ def find_variant_ids(detail):
 
 def patch_variant_price_by_id(product_id, variant_id, price_eur, sku=None):
     if not variant_id: return
-    # tentativo 1: PATCH /variants con lista {id,...}
     url1 = f"{BASE_V1}/products/{product_id}/variants"
     body1 = {"variants":[{"id": variant_id, "priceData":{"currency": CURRENCY, "price": price_eur}, **({"sku": sku} if sku else {})}]}
     try:
         http("PATCH", url1, body1); return
     except Exception as e:
         print(f"[WARN] PATCH variants-list fallita: {e}")
-    # tentativo 2: PATCH specifico /variants/{id}
     url2 = f"{BASE_V1}/products/{product_id}/variants/{variant_id}"
     body2 = {"variant":{"priceData":{"currency": CURRENCY, "price": price_eur}, **({"sku": sku} if sku else {})}}
     http("PATCH", url2, body2)
@@ -364,34 +384,36 @@ def patch_variant_price_by_id(product_id, variant_id, price_eur, sku=None):
 def patch_variants_prices(product_id, sku_base, price_eur, detail=None):
     as_price = round(price_eur * 0.30, 2)
     pa_price = round(price_eur * 0.95, 2)
-    detail = detail or get_product_detail(product_id)
-    ids = find_variant_ids(detail)
-    if not ids["anticipo_saldo"] and not ids["pagamento_anticipato"]:
-        # fallback al vecchio metodo per compatibilità vecchi prodotti
-        url = f"{BASE_V1}/products/{product_id}/variants"
-        body = {
-            "variants": [
-                {
-                    "choices": {"PREORDER PAYMENTS OPTIONS*": "ANTICIPO/SALDO"},
-                    "sku": f"{sku_base}-AS" if sku_base else "",
-                    "visible": True,
-                    "priceData": {"currency": CURRENCY, "price": as_price},
-                },
-                {
-                    "choices": {"PREORDER PAYMENTS OPTIONS*": "PAGAMENTO ANTICIPATO"},
-                    "sku": f"{sku_base}-PA" if sku_base else "",
-                    "visible": True,
-                    "priceData": {"currency": CURRENCY, "price": pa_price},
-                },
-            ]
-        }
-        http("PATCH", url, body)
-        return
-    # patch per id
-    if ids["anticipo_saldo"]:
-        patch_variant_price_by_id(product_id, ids["anticipo_saldo"], as_price, f"{sku_base}-AS" if sku_base else None)
-    if ids["pagamento_anticipato"]:
-        patch_variant_price_by_id(product_id, ids["pagamento_anticipato"], pa_price, f"{sku_base}-PA" if sku_base else None)
+    # tenta 2 volte a leggere le varianti (Wix a volte è lento a materializzarle)
+    for attempt in range(2):
+        detail = detail or get_product_detail(product_id)
+        ids = find_variant_ids(detail)
+        if ids["anticipo_saldo"] or ids["pagamento_anticipato"]:
+            if ids["anticipo_saldo"]:
+                patch_variant_price_by_id(product_id, ids["anticipo_saldo"], as_price, f"{sku_base}-AS" if sku_base else None)
+            if ids["pagamento_anticipato"]:
+                patch_variant_price_by_id(product_id, ids["pagamento_anticipato"], pa_price, f"{sku_base}-PA" if sku_base else None)
+            return
+        time.sleep(1.0)
+    # fallback: patch per scelta (per vecchi prodotti)
+    url = f"{BASE_V1}/products/{product_id}/variants"
+    body = {
+        "variants": [
+            {
+                "choices": {"PREORDER PAYMENTS OPTIONS*": "ANTICIPO/SALDO"},
+                "sku": f"{sku_base}-AS" if sku_base else "",
+                "visible": True,
+                "priceData": {"currency": CURRENCY, "price": as_price},
+            },
+            {
+                "choices": {"PREORDER PAYMENTS OPTIONS*": "PAGAMENTO ANTICIPATO"},
+                "sku": f"{sku_base}-PA" if sku_base else "",
+                "visible": True,
+                "priceData": {"currency": CURRENCY, "price": pa_price},
+            },
+        ]
+    }
+    http("PATCH", url, body)
 
 # ---------------- MAIN ----------------
 def run(csv_path):
@@ -415,20 +437,19 @@ def run(csv_path):
         scraped = scrape_all(row.get("url_produttore") or row.get("link_url_distributore") or row.get("url") or "")
         product, slug, sku, price = build_payload(row, scraped)
 
-        # dedup: trova prodotto esistente
+        # dedup
         existing_id = find_existing_product_id(product["name"], slug)
 
         try:
             if existing_id:
                 patch_product_v1(existing_id, product)
                 patch_variants_prices(existing_id, sku, price)
-                # categoria
+                # categoria (best effort, non blocca)
                 cat_name = (row.get("categoria") or row.get("categoria_wix") or "").strip()
                 if cat_name:
                     coll_id = find_collection_best(cat_name)
                     if coll_id:
                         add_product_to_collection(existing_id, coll_id)
-                        print(f"[INFO] Aggiornato e assegnato a collection '{cat_name}'")
                     else:
                         print(f"[WARN] Collection '{cat_name}' non trovata.")
                 print(f"[OK] Riga {idx} aggiornata '{name}'")
@@ -437,13 +458,14 @@ def run(csv_path):
                 pid = create_product_v1(product)
                 if not pid:
                     raise RuntimeError("ID prodotto non ricevuto.")
+                # attendo un attimo per sicurezza prima di patch varianti
+                time.sleep(0.7)
                 patch_variants_prices(pid, sku, price)
                 cat_name = (row.get("categoria") or row.get("categoria_wix") or "").strip()
                 if cat_name:
                     coll_id = find_collection_best(cat_name)
                     if coll_id:
                         add_product_to_collection(pid, coll_id)
-                        print(f"[INFO] Assegnato a collection '{cat_name}'")
                     else:
                         print(f"[WARN] Collection '{cat_name}' non trovata.")
                 print(f"[OK] Riga {idx} creato '{name}'")
