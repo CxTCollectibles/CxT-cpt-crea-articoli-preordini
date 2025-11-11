@@ -25,3 +25,4 @@ jobs:
           CSV_PATH: input/template_preordini_v7.csv
         run: |
           python3 wix_preorder_ingestion.py "$CSV_PATH"
+          
