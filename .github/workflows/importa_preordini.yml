@@ -1,19 +1,16 @@
-name: Importa preordini (manuale)
+name: Importa Preordini (manuale)
 
 on:
   workflow_dispatch:
     inputs:
-      csv_path:
-        description: "Percorso CSV (relativo alla root del repo). Es: input/template_preordini_v7.csv"
+      csv:
+        description: "Nome file CSV sotto la cartella input/"
         required: true
-        default: "input/template_preordini_v7.csv"
+        default: "template_preordini_v7.csv"
 
 jobs:
-  run:
+  importa:
     runs-on: ubuntu-latest
-    env:
-      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,10 +23,12 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml python-slugify deep-translator langdetect
+          pip install requests beautifulsoup4 lxml langdetect
 
-      - name: Run import
+      - name: Esegui import
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
         run: |
           set -e
-          python wix_preorder_ingestion.py --csv "${{ github.event.inputs.csv_path }}"
-          
+          python wix_preorder_ingestion.py --csv "input/${{ github.event.inputs.csv }}"
