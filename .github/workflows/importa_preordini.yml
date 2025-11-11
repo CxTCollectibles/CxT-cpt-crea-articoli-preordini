@@ -3,7 +3,7 @@ name: Importa Preordini (v7)
 on:
   workflow_dispatch:
     inputs:
-      csv_path: input/template_preordini_v7.csv
+      csv_path: 
         description: "Percorso CSV (utf-8-sig, ; separatore)"
         required: false
         default: "input/template_preordini_v7.csv"
