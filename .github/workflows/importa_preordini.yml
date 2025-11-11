@@ -22,6 +22,6 @@ jobs:
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          CSV_PATH: input/template_preordini_v7.csv   # metti il path reale del CSV nel repo
+          CSV_PATH: input/template_preordini_v7.csv
         run: |
           python3 wix_preorder_ingestion.py "$CSV_PATH"
