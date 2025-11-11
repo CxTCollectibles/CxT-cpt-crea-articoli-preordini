@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, csv, re, json, time, html
+import os, sys, csv, re, json, time, html, unicodedata, io
 from datetime import datetime
 from urllib.parse import urlparse
 import requests
@@ -9,7 +9,7 @@ import requests
 try:
     from bs4 import BeautifulSoup
 except Exception:
-    BeautifulSoup = None  # verrà installato dal workflow
+    BeautifulSoup = None  # il workflow installa bs4
 
 # ====== SECRETS ======
 WIX_API_KEY = os.environ.get("WIX_API_KEY")
@@ -49,6 +49,17 @@ def clean_text(t):
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
 
+def norm_key(k):
+    """normalizza chiavi: minuscole, senza accenti, spazi->underscore"""
+    if k is None: return ""
+    k = k.strip()
+    k = unicodedata.normalize("NFKD", k)
+    k = "".join(ch for ch in k if not unicodedata.combining(ch))
+    k = k.lower()
+    k = re.sub(r"[\s\-/]+", "_", k)
+    k = re.sub(r"_+", "_", k)
+    return k.strip("_")
+
 def quarter_from_date_or_text(eta_text):
     if not eta_text:
         return None, None
@@ -83,7 +94,7 @@ def prepend_eta_deadline(desc, eta_text, deadline_text):
         return banner + (desc or "")
     return desc
 
-# ====== SCRAPING ======
+# ====== SCRAPING GENERICO + ALCUNI DOMINI ======
 
 SKU_PATTERNS = r"(Codice Prodotto|Codice articolo|Artikelnummer|SKU)\s*[:#]?\s*([A-Z0-9\-_.]{4,})"
 GTIN_PATTERNS = r"(GTIN|EAN|UPC)\s*[:#]?\s*(\d{8,14})"
@@ -120,7 +131,7 @@ def longest_text_from(container):
 
 def scrape_generic(url):
     if not BeautifulSoup:
-        return {}  # se bs4 manca, saltiamo scraping (workflow lo installerà)
+        return {}
     r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -181,10 +192,12 @@ def wix_list_collections():
     return r.json().get("items", [])
 
 def best_collection_id_by_name(wanted):
-    wanted_n = wanted.strip().casefold()
+    wanted_n = (wanted or "").strip().casefold()
+    if not wanted_n:
+        return None
     items = wix_list_collections()
     for it in items:
-        if it.get("name","").casefold() == wanted_n:
+        if (it.get("name","").casefold() == wanted_n):
             return it["id"]
     for it in items:
         if wanted_n in it.get("name","").casefold():
@@ -201,8 +214,8 @@ def create_wix_product(payload):
 # ====== PAYLOAD ======
 
 def build_payload(row, scraped):
-    name   = (row["nome_articolo"] or "").strip()
-    price  = money(row["prezzo_eur"])
+    name   = (row.get("nome_articolo") or "").strip()
+    price  = money(row.get("prezzo_eur"))
     brand  = (row.get("brand") or "").strip() or None
     sku    = (row.get("sku") or scraped.get("sku") or slugify(name).upper())[:80]
     gtin   = (row.get("gtin_ean") or scraped.get("gtin") or "").strip() or None
@@ -215,26 +228,16 @@ def build_payload(row, scraped):
     descr = clean_text(row.get("descrizione") or scraped.get("description") or "")
     if len(descr) > 8000: descr = descr[:8000]
 
-    eta  = row.get("eta_raw") or scraped.get("eta")
-    ddl  = row.get("deadline_raw") or scraped.get("deadline")
+    eta  = row.get("eta_raw") or row.get("eta") or scraped.get("eta")
+    ddl  = row.get("deadline_raw") or row.get("preorder_scadenza") or row.get("deadline") or scraped.get("deadline")
     descr_final = prepend_eta_deadline(descr, eta, ddl)
 
-    # PREPARA HTML DESCRIZIONE (fix: niente backslash in f-string)
-    if descr_final:
-        desc_html = "<div><p>" + descr_final.replace("\n", "<br>") + "</p></div>"
-    else:
-        desc_html = ""
+    desc_html = "<div><p>" + descr_final.replace("\n", "<br>") + "</p></div>" if descr_final else ""
 
-    # varianti con prezzo
     prezzo_anticipo = money(price * 0.30)
     prezzo_prepag   = money(price * 0.95)
 
-    col_id = None
-    cat = (row.get("categoria") or "").strip()
-    if cat:
-        col_id = best_collection_id_by_name(cat)
-        if not col_id:
-            print(f"[WARN] Collection '{cat}' non trovata, il prodotto non sarà categorizzato.")
+    col_id = best_collection_id_by_name(row.get("categoria"))
 
     payload = {
         "name": name,
@@ -270,6 +273,9 @@ def build_payload(row, scraped):
 
     if col_id:
         payload["collectionIds"] = [col_id]
+    else:
+        if row.get("categoria"):
+            print(f"[WARN] Collection '{row.get('categoria')}' non trovata, il prodotto non sarà categorizzato.")
 
     if weight:
         payload["physicalProperties"] = { "weight": { "value": weight, "unit": "kg" } }
@@ -288,18 +294,91 @@ def build_payload(row, scraped):
 
     return payload
 
-# ====== CSV E MAIN ======
+# ====== CSV ROBUSTO ======
+
+SYNONYMS = {
+    "nome_articolo": ["nome_articolo","nome articolo","titolo","name","product_name","articolo"],
+    "prezzo_eur":    ["prezzo_eur","prezzo","prezzo (eur)","price","price_eur","prezzo euro"],
+    "url_produttore":["url_produttore","url","link_produttore","link produttore","product_url"],
+    "sku":           ["sku","codice","codice_prodotto","codice articolo"],
+    "gtin_ean":      ["gtin_ean","ean","gtin","barcode","upc"],
+    "peso_kg":       ["peso_kg","peso","peso (kg)","weight","peso kg"],
+    "descrizione":   ["descrizione","descrizione_prodotto","description","desc"],
+    "brand":         ["brand","marchio","marca"],
+    "categoria":     ["categoria","category","collection","collezione","categoria wix"],
+    "eta_raw":       ["eta_raw","eta","uscita_prevista","release","release_eta"],
+    "deadline_raw":  ["deadline_raw","preorder_scadenza","scadenza","deadline","order_deadline"]
+}
+
+def sniff_delimiter(text):
+    sample = "\n".join(text.splitlines()[:10])
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,|\t,")
+        return dialect.delimiter
+    except Exception:
+        line0 = text.splitlines()[0] if text.splitlines() else ""
+        counts = {sep: line0.count(sep) for sep in [",",";","|","\t"]}
+        return max(counts, key=counts.get) if counts else ","
 
 def parse_csv(path):
+    with open(path, "rb") as fb:
+        raw = fb.read()
+    # decodifica
+    for enc in ("utf-8-sig","utf-8","latin1"):
+        try:
+            text = raw.decode(enc)
+            used_enc = enc
+            break
+        except Exception:
+            continue
+    else:
+        die("Impossibile decodificare il CSV (encoding).")
+
+    delim = sniff_delimiter(text)
+    print(f"[INFO] CSV encoding={used_enc} delimiter='{delim}'")
+
+    f = io.StringIO(text)
+    rdr = csv.DictReader(f, delimiter=delim)
+    if not rdr.fieldnames:
+        die("CSV senza intestazioni.")
+
+    # mappa colonne normalizzate
+    base_fields = [norm_key(h) for h in rdr.fieldnames]
+
     rows = []
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        rdr = csv.DictReader(f)
-        for i, r in enumerate(rdr, start=2):
-            if not (r.get("nome_articolo") and r.get("prezzo_eur")):
-                print(f"[SKIP] Riga {i}: nome_articolo o prezzo_eur mancante.")
-                continue
-            rows.append(r)
+    for i, r in enumerate(rdr, start=2):
+        r_norm = { norm_key(k): (v or "").strip() for k,v in r.items() }
+
+        def pick(stdname):
+            for cand in SYNONYMS.get(stdname, [stdname]):
+                c = norm_key(cand)
+                if c in r_norm and r_norm[c]:
+                    return r_norm[c]
+            return ""
+
+        row = {
+            "nome_articolo": pick("nome_articolo"),
+            "prezzo_eur":    pick("prezzo_eur"),
+            "url_produttore":pick("url_produttore"),
+            "sku":           pick("sku"),
+            "gtin_ean":      pick("gtin_ean"),
+            "peso_kg":       pick("peso_kg"),
+            "descrizione":   pick("descrizione"),
+            "brand":         pick("brand"),
+            "categoria":     pick("categoria"),
+            "eta_raw":       pick("eta_raw"),
+            "deadline_raw":  pick("deadline_raw")
+        }
+
+        if not (row["nome_articolo"] and row["prezzo_eur"]):
+            print(f"[SKIP] Riga {i}: nome_articolo o prezzo_eur mancante. (Headers: {rdr.fieldnames})")
+            continue
+
+        rows.append(row)
+
     return rows
+
+# ====== MAIN ======
 
 def run(csv_path):
     if not WIX_API_KEY or not WIX_SITE_ID:
