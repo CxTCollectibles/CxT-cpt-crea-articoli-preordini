@@ -26,11 +26,41 @@ def _headers():
     }
 
 def http(method, url, payload=None):
-    r = requests.request(method, url, timeout=TIMEOUT, headers=_headers(),
-                         data=json.dumps(payload) if payload is not None else None)
+    data_str = json.dumps(payload) if payload is not None else None
+    r = requests.request(method, url, timeout=TIMEOUT, headers=_headers(), data=data_str)
     if r.status_code >= 400:
         raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text}")
-    return r.json() if r.text else {}
+    try:
+        return r.json() if r.text else {}
+    except Exception:
+        # risposta non-JSON: ritorna testo grezzo
+        return {"_raw": r.text}
+
+# ---------- helper id robusto ----------
+def extract_product_id(resp):
+    """Prova tutte le forme note per ricavare l'ID prodotto."""
+    if not isinstance(resp, dict):
+        return None
+    # diretti
+    for k in ("id", "productId"):
+        v = resp.get(k)
+        if isinstance(v, str) and v:
+            return v
+    # annidati comuni
+    for k in ("product", "createdProduct", "data"):
+        v = resp.get(k)
+        if isinstance(v, dict):
+            pid = extract_product_id(v)
+            if pid:
+                return pid
+    # liste (capita che rientri un array)
+    for k in ("products", "items", "results"):
+        arr = resp.get(k)
+        if isinstance(arr, list) and arr:
+            v = arr[0].get("id")
+            if isinstance(v, str) and v:
+                return v
+    return None
 
 # ---------- csv ----------
 def parse_csv(path):
@@ -101,7 +131,7 @@ def add_product_to_collection(product_id, collection_id):
 # ---------- create product ----------
 def build_product_payload_v1(row):
     full_name = row.get("nome_articolo","").strip()
-    # Wix V1: max 80 caratteri per name
+    # name max 80
     name80 = full_name[:80]
 
     # prezzo
@@ -115,7 +145,7 @@ def build_product_payload_v1(row):
     url_distrib = row.get("url_produttore") or row.get("link_url_distributore") or row.get("url") or ""
     descr_raw = fetch_description(url_distrib).strip() or row.get("descrizione","").strip()
 
-    # opzionali dal CSV se già presenti con i nomi del tuo v7
+    # opzionali CSV (accetta vari nomi che hai usato)
     eta = row.get("eta") or row.get("eta_trimestre") or row.get("eta_raw") or ""
     deadline = row.get("preorder_scadenza") or row.get("deadline_preordine") or row.get("deadline_raw") or ""
 
@@ -126,7 +156,7 @@ def build_product_payload_v1(row):
 
     desc_html = "<div><p>" + (intro + (descr_raw or "")).replace("\n","<br>") + "</p></div>"
 
-    # slug: uso il nome tagliato + suffisso sku se presente per univocità
+    # slug: nome tagliato + sku se presente
     base_slug = slugify(name80)
     if sku:
         base_slug = f"{base_slug}-{slugify(sku)}"
@@ -160,15 +190,23 @@ def build_product_payload_v1(row):
 
 def create_product_v1(product):
     url = f"{BASE_V1}/products"
-    try:
-        data = http("POST", url, {"product": product})
-        return data.get("id")
-    except RuntimeError as e:
-        msg = str(e)
-        if "Expected an object" in msg:
-            data = http("POST", url, product)
-            return data.get("id")
-        raise
+
+    # 1) wrapper {"product": {...}}
+    resp1 = http("POST", url, {"product": product})
+    pid1 = extract_product_id(resp1)
+    if pid1:
+        return pid1
+
+    # 2) senza wrapper
+    resp2 = http("POST", url, product)
+    pid2 = extract_product_id(resp2)
+    if pid2:
+        return pid2
+
+    # 3) nessun id: log di debug e errore esplicito
+    print("[DEBUG] Create product: risposta senza id (tentativo 1):", json.dumps(resp1, ensure_ascii=False)[:800])
+    print("[DEBUG] Create product: risposta senza id (tentativo 2):", json.dumps(resp2, ensure_ascii=False)[:800])
+    return None
 
 def patch_variants_v1(product_id, sku_base, price_eur):
     as_price = round(price_eur * 0.30, 2)
