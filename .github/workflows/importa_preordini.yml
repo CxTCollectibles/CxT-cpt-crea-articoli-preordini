@@ -1,21 +1,16 @@
-name: Importa Preordini su Wix
+name: Importa Preordini (v7)
 
 on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: "Percorso CSV (es. input/template_preordini_v7.csv)"
-        required: true
+        description: "Percorso CSV (utf-8-sig, ; separatore)"
+        required: false
         default: "input/template_preordini_v7.csv"
-      dry_run:
-        description: "Esegui senza scrivere (true/false)"
-        required: true
-        default: "false"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,16 +22,14 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Importa CSV
+      - name: Run importer
         env:
-          WIX_CLIENT_ID: ${{ secrets.WIX_CLIENT_ID }}
-          WIX_CLIENT_SECRET: ${{ secrets.WIX_CLIENT_SECRET }}
-          WIX_ACCOUNT_ID: ${{ secrets.WIX_ACCOUNT_ID }}
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+          CSV_PATH: ${{ github.event.inputs.csv_path }}
         run: |
           set -e
-          python wix_preorder_ingestion.py \
-            --csv "${{ github.event.inputs.csv_path }}" \
-            --dry-run "${{ github.event.inputs.dry_run }}"
+          python wix_preorder_ingestion.py
