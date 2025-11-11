@@ -13,10 +13,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Secrets richiesti (impostali in Repo → Settings → Secrets and variables → Actions)
       WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
       WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-      # Costruiamo il percorso finale con prefisso 'input/'
       CSV_BASENAME: ${{ inputs.csv }}
 
     steps:
@@ -46,7 +44,6 @@ jobs:
           echo "Prime 5 righe:"
           head -n 5 "${CSV_PATH}" || true
 
-      # Precheck facoltativo: prova che l'API risponda (non fallisce il job se 403)
       - name: Precheck API (facoltativo)
         shell: bash
         run: |
@@ -55,8 +52,7 @@ jobs:
             -H "Authorization: ${WIX_API_KEY}" \
             -H "wix-site-id: ${WIX_SITE_ID}" \
             -H "Content-Type: application/json" \
-            -d '{"query":{"paging":{"limit":1}}}' \
-            || true
+            -d '{"query":{"paging":{"limit":1}}}' || true
           echo ""
           echo "Se qui compare 403, controlla i permessi della chiave API (Stores Read/Write)."
 
