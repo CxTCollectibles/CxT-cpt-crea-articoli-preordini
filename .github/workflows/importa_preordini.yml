@@ -6,7 +6,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,6 +22,6 @@ jobs:
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          CSV_PATH: input/template_preordini_v7.csv   # <-- metti qui il percorso REALE nel repo
+          CSV_PATH: input/template_preordini_v7.csv   # metti il path reale del CSV nel repo
         run: |
           python3 wix_preorder_ingestion.py "$CSV_PATH"
