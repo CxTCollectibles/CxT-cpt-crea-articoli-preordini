@@ -82,7 +82,6 @@ def parse_csv(path):
 def quarter_from_date_or_text(t):
     if not t: return None
     t = t.strip()
-    # mm/yyyy
     m = re.search(r"(\d{1,2})/(\d{4})", t)
     month = year = None
     if m:
@@ -94,10 +93,7 @@ def quarter_from_date_or_text(t):
             month = MMM.get(m2.group(1).lower()[:3]); year = int(m2.group(2))
     if not (month and year): return None
     q = (month-1)//3 + 1
-    qr = f"Q{q}"
-    if "FINE" in t.upper() or month in (3,6,9,12):
-        qr = f"Q{q} - Q{min(4,q+1)}" if q < 4 else "Q4"
-    return qr
+    return f"Q{q} - Q{min(4,q+1)}" if q < 4 else "Q4"
 
 def build_banner(eta_text, deadline_text):
     parts = []
@@ -120,7 +116,7 @@ def scrape_all(url):
         h = requests.get(url, timeout=30, headers={"User-Agent":"Mozilla/5.0"}).text
         soup = BeautifulSoup(h, "lxml")
 
-        # JSON-LD first
+        # JSON-LD
         for tag in soup.find_all("script", {"type":"application/ld+json"}):
             try:
                 j = json.loads(tag.string or "")
@@ -136,12 +132,12 @@ def scrape_all(url):
                     out["gtin"] = out["gtin"] or obj.get("gtin13") or obj.get("gtin") or obj.get("gtin14") or obj.get("gtin8")
             pick(j)
 
-        # fallback desc: og:description
+        # fallback desc
         if not out["description"]:
             meta = soup.select_one('meta[property="og:description"]') or soup.select_one('meta[name="description"]')
             if meta and meta.get("content"): out["description"] = meta["content"]
 
-        # if still short, collect longest paragraph
+        # fallback lungo
         if not out["description"] or len(out["description"]) < 200:
             txts = [t.get_text(" ", strip=True) for t in soup.select("main, #content, article, .product, .description, div, section, p")]
             txts = [t for t in txts if len(t) > 120]
@@ -158,15 +154,8 @@ def scrape_all(url):
         m = re.search(ETA_PAT, full, re.I)
         if m: out["eta"] = m.group(2)
 
-        # HEO affinamenti
-        host = urlparse(url).netloc
-        if "heo.com" in host:
-            m = re.search(r"ETA[:\s]+([A-Za-z]{3,}\s*\d{4}|\d{2}/\d{4}|FINE\s*\d{2}/\d{4})", full, re.I)
-            if m: out["eta"] = m.group(1).strip()
-
     except Exception as e:
         print(f"[WARN] Scrape fallito: {e}")
-    # pulizia base
     out["description"] = (out["description"] or "").strip()
     return out
 
@@ -178,17 +167,15 @@ def ensure_english(text):
         lang = detect(sample)
     except Exception:
         lang = "en"
-    if lang == "en":
+    if lang.startswith("en"):
         return text
     try:
-        # MyMemory ha limiti: traduciamo a blocchi da ~2000 char
-        chunks = []
-        src = "it" if lang == "it" else "auto"
-        trans = MyMemoryTranslator(source=src, target="en")
-        s = text
+        # MyMemory vuole i nomi lingua, non 'it'/'en'
+        src = "italian" if lang.startswith("it") else "auto"
+        trans = MyMemoryTranslator(source=src, target="english")
+        chunks, s = [], text
         while s:
-            chunk = s[:2000]
-            s = s[2000:]
+            chunk = s[:1800]; s = s[1800:]
             chunks.append(trans.translate(chunk))
         return "\n".join(chunks)
     except Exception as e:
@@ -216,11 +203,9 @@ def find_collection_best(name):
     if not name: return None
     target = norm(name)
     items = list_collections_all()
-    # match esatto
     for c in items:
         if norm(c.get("name","")) == target:
             return c.get("id")
-    # match contenuto
     for c in items:
         n = norm(c.get("name",""))
         if target in n or n in target:
@@ -241,11 +226,10 @@ def query_products_page(limit=50, cursor=None):
     return http("POST", url, body)
 
 def find_existing_product_id(name, slug):
-    # cerca per slug e per nome (casefold)
     target_name = norm(name)
     target_slug = norm(slug)
     cursor = None
-    for _ in range(20):  # fino a ~1000 items
+    for _ in range(20):
         data = query_products_page(limit=50, cursor=cursor)
         arr = data.get("products", []) or data.get("items", [])
         for p in arr:
@@ -267,12 +251,9 @@ def build_payload(row, scraped):
     sku = (row.get("sku") or scraped.get("sku") or "").strip()
     brand = (row.get("brand") or "").strip() or None
 
-    # descrizione: CSV > scraping
     descr_raw = (row.get("descrizione") or "").strip() or scraped.get("description") or ""
-    # traduci in inglese se non è già EN
     descr_en = ensure_english(descr_raw)
 
-    # ETA/Deadline: CSV o scraping
     eta = (row.get("eta") or row.get("eta_trimestre") or row.get("eta_raw") or scraped.get("eta") or "").strip()
     ddl = (row.get("preorder_scadenza") or row.get("deadline_preordine") or row.get("deadline_raw") or scraped.get("deadline") or "").strip()
     banner = build_banner(eta, ddl)
@@ -313,11 +294,9 @@ def build_payload(row, scraped):
 # ---------------- CREATE/UPDATE ----------------
 def create_product_v1(product):
     url = f"{BASE_V1}/products"
-    # 1) wrapper
     r1 = http("POST", url, {"product": product})
     pid = r1.get("id") or r1.get("productId") or (r1.get("product") or {}).get("id")
     if pid: return pid
-    # 2) senza wrapper
     r2 = http("POST", url, product)
     pid = r2.get("id") or r2.get("productId") or (r2.get("product") or {}).get("id")
     if pid: return pid
@@ -326,30 +305,93 @@ def create_product_v1(product):
 
 def patch_product_v1(product_id, product):
     url = f"{BASE_V1}/products/{product_id}"
-    body = {"product": product}
-    http("PATCH", url, body)
+    http("PATCH", url, {"product": product})
 
-def patch_variants_v1(product_id, sku_base, price_eur):
+# ---- Variants helpers: leggi e patcha per variantId ----
+def get_product_detail(product_id):
+    url = f"{BASE_V1}/products/{product_id}"
+    try:
+        return http("GET", url)
+    except Exception as e:
+        print(f"[WARN] GET product detail fallita: {e}")
+        return {}
+
+def normalize_choice(s):
+    # ignora maiuscole, slash, asterischi e spazi
+    s = (s or "").strip().lower()
+    s = s.replace("*","").replace("/","/").replace("  "," ")
+    return s
+
+def find_variant_ids(detail):
+    """Ritorna dict: {'anticipo_saldo': variantId, 'pagamento_anticipato': variantId} cercando per scelte reali."""
+    ids = {"anticipo_saldo": None, "pagamento_anticipato": None}
+    # le varianti possono stare in detail['product']['variants'] oppure top-level 'variants'
+    variants = []
+    if isinstance(detail, dict):
+        if isinstance(detail.get("product"), dict):
+            variants = detail["product"].get("variants") or []
+        variants = variants or detail.get("variants") or []
+    for v in variants:
+        ch = v.get("choices") or {}
+        # trova la key dell'opzione preorder a prescindere dal nome esatto
+        key = None
+        for k in ch.keys():
+            if "preorder" in norm(k) or "payments" in norm(k):
+                key = k; break
+        if not key and ch:
+            key = list(ch.keys())[0]
+        val = str(ch.get(key,"")).strip().lower()
+        if "anticipo" in val:
+            ids["anticipo_saldo"] = v.get("id")
+        elif "pagamento" in val:
+            ids["pagamento_anticipato"] = v.get("id")
+    return ids
+
+def patch_variant_price_by_id(product_id, variant_id, price_eur, sku=None):
+    if not variant_id: return
+    # tentativo 1: PATCH /variants con lista {id,...}
+    url1 = f"{BASE_V1}/products/{product_id}/variants"
+    body1 = {"variants":[{"id": variant_id, "priceData":{"currency": CURRENCY, "price": price_eur}, **({"sku": sku} if sku else {})}]}
+    try:
+        http("PATCH", url1, body1); return
+    except Exception as e:
+        print(f"[WARN] PATCH variants-list fallita: {e}")
+    # tentativo 2: PATCH specifico /variants/{id}
+    url2 = f"{BASE_V1}/products/{product_id}/variants/{variant_id}"
+    body2 = {"variant":{"priceData":{"currency": CURRENCY, "price": price_eur}, **({"sku": sku} if sku else {})}}
+    http("PATCH", url2, body2)
+
+def patch_variants_prices(product_id, sku_base, price_eur, detail=None):
     as_price = round(price_eur * 0.30, 2)
     pa_price = round(price_eur * 0.95, 2)
-    body = {
-        "variants": [
-            {
-                "choices": {"PREORDER PAYMENTS OPTIONS*": "ANTICIPO/SALDO"},
-                "sku": f"{sku_base}-AS" if sku_base else "",
-                "visible": True,
-                "priceData": {"currency": CURRENCY, "price": as_price},
-            },
-            {
-                "choices": {"PREORDER PAYMENTS OPTIONS*": "PAGAMENTO ANTICIPATO"},
-                "sku": f"{sku_base}-PA" if sku_base else "",
-                "visible": True,
-                "priceData": {"currency": CURRENCY, "price": pa_price},
-            },
-        ]
-    }
-    url = f"{BASE_V1}/products/{product_id}/variants"
-    http("PATCH", url, body)
+    detail = detail or get_product_detail(product_id)
+    ids = find_variant_ids(detail)
+    if not ids["anticipo_saldo"] and not ids["pagamento_anticipato"]:
+        # fallback al vecchio metodo per compatibilità vecchi prodotti
+        url = f"{BASE_V1}/products/{product_id}/variants"
+        body = {
+            "variants": [
+                {
+                    "choices": {"PREORDER PAYMENTS OPTIONS*": "ANTICIPO/SALDO"},
+                    "sku": f"{sku_base}-AS" if sku_base else "",
+                    "visible": True,
+                    "priceData": {"currency": CURRENCY, "price": as_price},
+                },
+                {
+                    "choices": {"PREORDER PAYMENTS OPTIONS*": "PAGAMENTO ANTICIPATO"},
+                    "sku": f"{sku_base}-PA" if sku_base else "",
+                    "visible": True,
+                    "priceData": {"currency": CURRENCY, "price": pa_price},
+                },
+            ]
+        }
+        http("PATCH", url, body)
+        return
+    # patch per id
+    if ids["anticipo_saldo"]:
+        patch_variant_price_by_id(product_id, ids["anticipo_saldo"], as_price, f"{sku_base}-AS" if sku_base else None)
+    if ids["pagamento_anticipato"]:
+        patch_variant_price_by_id(product_id, ids["pagamento_anticipato"], pa_price, f"{sku_base}-PA" if sku_base else None)
 
 # ---------------- MAIN ----------------
 def run(csv_path):
@@ -370,9 +412,7 @@ def run(csv_path):
         name = row.get("nome_articolo","").strip()
         print(f"[WORK] Riga {idx}: {name}")
 
-        # scraping sorgente (per descrizione/eta/deadline se mancano)
         scraped = scrape_all(row.get("url_produttore") or row.get("link_url_distributore") or row.get("url") or "")
-
         product, slug, sku, price = build_payload(row, scraped)
 
         # dedup: trova prodotto esistente
@@ -380,9 +420,8 @@ def run(csv_path):
 
         try:
             if existing_id:
-                # Update
                 patch_product_v1(existing_id, product)
-                patch_variants_v1(existing_id, sku, price)
+                patch_variants_prices(existing_id, sku, price)
                 # categoria
                 cat_name = (row.get("categoria") or row.get("categoria_wix") or "").strip()
                 if cat_name:
@@ -395,13 +434,10 @@ def run(csv_path):
                 print(f"[OK] Riga {idx} aggiornata '{name}'")
                 updated += 1
             else:
-                # Create
                 pid = create_product_v1(product)
                 if not pid:
                     raise RuntimeError("ID prodotto non ricevuto.")
-                # varianti
-                patch_variants_v1(pid, sku, price)
-                # categoria
+                patch_variants_prices(pid, sku, price)
                 cat_name = (row.get("categoria") or row.get("categoria_wix") or "").strip()
                 if cat_name:
                     coll_id = find_collection_best(cat_name)
@@ -416,7 +452,7 @@ def run(csv_path):
         except Exception as e:
             print(f"[ERRORE] Riga {idx} '{name}': {e}")
 
-        time.sleep(0.2)
+        time.sleep(0.25)
 
     if created == 0 and updated == 0:
         print("[ERRORE] Nessun prodotto creato/aggiornato.")
