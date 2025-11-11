@@ -1,24 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Ingestione preordini su Wix Stores partendo dal CSV V7 fornito dall'utente.
-Campi usati dal CSV: nome_articolo; prezzo_eur; sku; descrizione; preorder_deadline; eta; brand; categoria
+Import preordini su Wix Stores da CSV V7 (colonne minime: nome_articolo;prezzo_eur;sku).
+Colonne usate se presenti: descrizione;preorder_deadline;eta;brand;categoria
 
-Comportamento:
-- Categorie risolte via POST /collections/query
-- Creazione/aggiornamento prodotto:
-  productType=physical, brand, ribbon PREORDER, tag PREORDER
-  description = intestazione (PREORDER DEADLINE, ETA) + riga vuota + corpo descrizione
-- Opzione + varianti:
-  Opzione: PREORDER PAYMENTS OPTIONS*
-  Scelte:  ANTICIPO/SALDO (30% del prezzo)
-           PAGAMENTO ANTICIPATO (prezzo -5%, compareAt = prezzo pieno)
-- Prova ad abilitare il flag preordine (best-effort)
-- Evita duplicati cercando per SKU (se query SKU fallisce, procede comunque)
+Cosa fa:
+- Risolve ID categorie via /collections/query.
+- Se SKU esiste: patch del prodotto (nome, descrizione, brand, prezzo, categorie, ribbon/tags)
+  e forzatura delle Product Options corrette.
+- Se SKU non esiste: crea il prodotto con Product Options corrette.
+- Imposta due varianti con prezzi:
+    ANTICIPO/SALDO = 30% del prezzo
+    PAGAMENTO ANTICIPATO = prezzo -5%, con compareAt al prezzo pieno
+- Aggiunge riga vuota fra intestazione (DEADLINE/ETA) e corpo descrizione.
+- Prova ad attivare flag preordine (best-effort).
 
-Env richieste:
-  WIX_API_KEY, WIX_SITE_ID
-Facoltativa:
-  CSV_PATH (percorso CSV); altrimenti prova percorsi comuni o argv[1]
+Env richieste: WIX_API_KEY, WIX_SITE_ID
+CSV: 1) argomento CLI, oppure 2) env CSV_PATH, oppure 3) percorsi noti.
 """
 
 import os, sys, csv, json
@@ -34,82 +31,74 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def log(*a): 
-    print(*a, flush=True)
+def log(*a): print(*a, flush=True)
+def round_price(x): return float(f"{x:.2f}")
 
-def round_price(x):
-    return float(f"{x:.2f}")
-
+# ---------- utils ----------
 def resolve_csv_path():
-    candidates = []
+    cand = []
     if len(sys.argv) > 1 and sys.argv[1].strip():
-        candidates.append(sys.argv[1].strip())
+        cand.append(sys.argv[1].strip())
     if os.environ.get("CSV_PATH"):
-        candidates.append(os.environ["CSV_PATH"].strip())
-    candidates += [
+        cand.append(os.environ["CSV_PATH"].strip())
+    cand += [
         "template_preordini_v7.csv",
         "input/template_preordini_v7.csv",
         "data/template_preordini_v7.csv",
         "csv/template_preordini_v7.csv"
     ]
-    for p in candidates:
+    for p in cand:
         if p and os.path.exists(p):
             return p
-    raise FileNotFoundError(f"CSV non trovato. Provati: {candidates}")
+    raise FileNotFoundError(f"CSV non trovato. Provati: {cand}")
 
 def get_collections_map():
-    """Ritorna {nome_lower: id} usando POST /collections/query + paging."""
     url = f"{WIX_API}/collections/query"
-    collections = {}
-    cursor = None
+    out, cursor = {}, None
     while True:
         payload = {"query": {"paging": {"limit": 100}}}
         if cursor:
             payload["query"]["paging"]["cursor"] = cursor
         r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
-        if not r.ok:
-            raise requests.HTTPError(f"{r.status_code} {r.text}")
+        r.raise_for_status()
         data = r.json()
         for c in data.get("collections", []):
             name = (c.get("name") or "").strip()
             cid = c.get("id")
             if name and cid:
-                collections[name.lower()] = cid
+                out[name.lower()] = cid
         cursor = data.get("paging", {}).get("nextCursor")
         if not cursor:
             break
-    return collections
+    return out
 
 def query_product_by_sku(sku):
-    """Cerca un prodotto per SKU. Se Wix si lamenta, restituisce None."""
+    """Cerca 1 prodotto per SKU. Non blocca se la query è schizzinosa."""
     url = f"{WIX_API}/products/query"
-    # Alcune istanze accettano {"sku":{"$eq":sku}}, altre vogliono il valore diretto.
     payloads = [
         {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}},
-        {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}},
+        {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}}
     ]
-    for payload in payloads:
-        r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
+    for p in payloads:
+        r = requests.post(url, headers=HEADERS, data=json.dumps(p), timeout=30)
         if r.ok:
             items = r.json().get("products", [])
             return items[0] if items else None
-    # se entrambe falliscono, non blocchiamo il flusso (torna None)
     return None
 
 def build_description(row):
     descr_raw = (row.get("descrizione") or "").strip()
-    dl = (row.get("preorder_deadline") or "").strip()
+    dl  = (row.get("preorder_deadline") or "").strip()
     eta = (row.get("eta") or "").strip()
 
-    head_parts = []
-    if dl:  head_parts.append(f"<strong>PREORDER DEADLINE:</strong> {dl}")
-    if eta: head_parts.append(f"<strong>ETA:</strong> {eta}")
-    head_html = "<br>".join(head_parts) if head_parts else ""
+    head = []
+    if dl:  head.append(f"<strong>PREORDER DEADLINE:</strong> {dl}")
+    if eta: head.append(f"<strong>ETA:</strong> {eta}")
+    head_html = "<br>".join(head) if head else ""
 
     body_html = (descr_raw.replace("\n", "<br>") if descr_raw else "").strip()
 
     if head_html and body_html:
-        # riga vuota fra testa e corpo
         return f"<p>{head_html}</p><p><br></p><p>{body_html}</p>"
     elif head_html:
         return f"<p>{head_html}</p>"
@@ -117,65 +106,106 @@ def build_description(row):
         return f"<p>{body_html}</p>"
     return ""
 
+# ---------- product creation / update ----------
+OPTION_NAME = "PREORDER PAYMENTS OPTIONS*"
+CHOICE_DEPOSIT = "ANTICIPO/SALDO"
+CHOICE_PREPAY  = "PAGAMENTO ANTICIPATO"
+
+def options_payload():
+    return [{
+        "name": OPTION_NAME,
+        "choices": [
+            {"value": CHOICE_DEPOSIT, "description": CHOICE_DEPOSIT},
+            {"value": CHOICE_PREPAY,  "description": CHOICE_PREPAY}
+        ]
+    }]
+
 def create_product(row, collection_id=None):
     name = (row.get("nome_articolo") or "").strip()
-    if len(name) > 80:
-        name = name[:80]
+    if len(name) > 80: name = name[:80]
     price = float(str(row.get("prezzo_eur") or "0").replace(",", "."))
-    sku = (row.get("sku") or "").strip()
-    brand = (row.get("brand") or "").strip()
+    sku   = (row.get("sku") or "").strip()
+    brand = (row.get("brand") or "").strip() or None
 
-    product_obj = {
+    product = {
         "name": name,
         "sku": sku,
-        "productType": "physical",  # lowercase, o Wix piange
+        "productType": "physical",
         "priceData": {"price": round_price(price)},
         "description": build_description(row),
-        "brand": brand if brand else None,
+        "brand": brand,
         "ribbon": "PREORDER",
         "tags": ["PREORDER"],
         "collectionIds": [collection_id] if collection_id else [],
-        "productOptions": [{
-            "name": "PREORDER PAYMENTS OPTIONS*",
-            "choices": [
-                {"value": "ANTICIPO/SALDO", "description": "ANTICIPO/SALDO"},
-                {"value": "PAGAMENTO ANTICIPATO", "description": "PAGAMENTO ANTICIPATO"}
-            ]
-        }]
+        "productOptions": options_payload()
     }
-    # ripulisci None e liste vuote
-    product_obj = {k: v for k, v in product_obj.items() if v not in (None, "", [])}
+    # pulizia
+    product = {k: v for k, v in product.items() if v not in (None, "", [])}
 
-    url = f"{WIX_API}/products"
-    r = requests.post(url, headers=HEADERS, data=json.dumps({"product": product_obj}), timeout=60)
+    r = requests.post(f"{WIX_API}/products", headers=HEADERS,
+                      data=json.dumps({"product": product}), timeout=60)
     if not r.ok:
         raise RuntimeError(f"POST /products failed {r.status_code}: {r.text}")
     return r.json().get("product", {}).get("id")
 
+def force_options(product_id):
+    """Forza le Product Options corrette sul prodotto esistente."""
+    patch = {"product": {"id": product_id, "productOptions": options_payload()}}
+    r = requests.patch(f"{WIX_API}/products/{product_id}", headers=HEADERS,
+                       data=json.dumps(patch), timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"PATCH options failed {r.status_code}: {r.text}")
+
+def patch_product_main(pid, row, price, collection_id):
+    name = (row.get("nome_articolo") or "").strip()
+    if len(name) > 80: name = name[:80]
+    brand = (row.get("brand") or "").strip() or None
+
+    patch = {
+        "product": {
+            "id": pid,
+            "name": name,
+            "description": build_description(row),
+            "brand": brand,
+            "priceData": {"price": round_price(price)},
+            "ribbon": "PREORDER",
+            "tags": ["PREORDER"]
+        }
+    }
+    if collection_id:
+        patch["product"]["collectionIds"] = [collection_id]
+
+    r = requests.patch(f"{WIX_API}/products/{pid}", headers=HEADERS,
+                       data=json.dumps(patch), timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"PATCH /products/{pid} failed {r.status_code}: {r.text}")
+
+# ---------- variants ----------
 def patch_variants(product_id, base_price, base_sku):
+    """Qui il fix: choices deve essere UN OGGETTO {optionName: choiceValue}."""
     deposit = round_price(base_price * 0.30)
     prepay  = round_price(base_price * 0.95)
-    url = f"{WIX_API}/products/{product_id}/variants"
+
     payload = {
         "variants": [
             {
-                "choices": [{"title": "PREORDER PAYMENTS OPTIONS*", "description": "ANTICIPO/SALDO"}],
+                "choices": { OPTION_NAME: CHOICE_DEPOSIT },
                 "priceData": {"price": deposit},
                 "sku": f"{base_sku}-DEP"
             },
             {
-                "choices": [{"title": "PREORDER PAYMENTS OPTIONS*", "description": "PAGAMENTO ANTICIPATO"}],
+                "choices": { OPTION_NAME: CHOICE_PREPAY },
                 "priceData": {"price": prepay, "compareAtPrice": round_price(base_price)},
                 "sku": f"{base_sku}-PREPAY"
             }
         ]
     }
-    r = requests.patch(url, headers=HEADERS, data=json.dumps(payload), timeout=60)
+    r = requests.patch(f"{WIX_API}/products/{product_id}/variants",
+                       headers=HEADERS, data=json.dumps(payload), timeout=60)
     if not r.ok:
         raise RuntimeError(f"PATCH /products/{product_id}/variants failed {r.status_code}: {r.text}")
 
 def try_enable_preorder(product_id):
-    """Best-effort su diverse proprietà viste in natura."""
     url = f"{WIX_API}/products/{product_id}"
     candidates = [
         {"product": {"isPreOrder": True}},
@@ -183,38 +213,31 @@ def try_enable_preorder(product_id):
         {"product": {"preOrder": True}},
     ]
     for p in candidates:
-        r = requests.patch(url, headers=HEADERS, data=json.dumps(p), timeout=20)
-        if r.ok:
-            return True
+        r = requests.patch(url, headers=HEADERS, data=json.dumps(p), timeout=15)
+        if r.ok: return True
     return False
 
 def add_to_collections(product_id, collection_id):
-    if not collection_id:
-        return
+    if not collection_id: return
     url = f"{WIX_API}/collections/{collection_id}/products/add"
     payload = {"productIds": [product_id]}
-    r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
-    # se non va, non bloccare
-    if not r.ok:
-        log(f"[WARN] add_to_collections ignorato: {r.status_code}")
+    requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=20)
 
+# ---------- main ----------
 def main():
     if not API_KEY or not SITE_ID:
-        print("[FATAL] WIX_API_KEY / WIX_SITE_ID mancanti")
-        sys.exit(2)
+        print("[FATAL] WIX_API_KEY / WIX_SITE_ID mancanti"); sys.exit(2)
 
     log("[PRECHECK] API ok. Inizio…")
 
-    # Categorie
+    # categorie
     try:
         col_map = get_collections_map()
-        if col_map:
-            log("[INFO] Categorie caricate:", ", ".join(list(col_map.keys())[:20]))
+        log("[INFO] Categorie caricate:", ", ".join(list(col_map.keys())[:20]))
     except Exception as e:
         log(f"[WARN] Lettura categorie fallita: {e}")
         col_map = {}
 
-    # CSV
     csv_path = resolve_csv_path()
     log(f"[INFO] CSV: {csv_path}")
 
@@ -222,36 +245,29 @@ def main():
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
         rd = csv.DictReader(fh, delimiter=";")
         required = {"nome_articolo", "prezzo_eur", "sku"}
-        missing = required - set([c.strip() for c in (rd.fieldnames or [])])
-        if missing:
-            print(f"[FATAL] CSV mancano colonne: {sorted(missing)}")
-            sys.exit(2)
+        if not rd.fieldnames or not required.issubset(set([c.strip() for c in rd.fieldnames])):
+            miss = required - set([c.strip() for c in (rd.fieldnames or [])])
+            print(f"[FATAL] CSV mancano colonne: {sorted(miss)}"); sys.exit(2)
 
         for i, row in enumerate(rd, start=2):
             name = (row.get("nome_articolo") or "").strip()
             sku  = (row.get("sku") or "").strip()
             price_raw = row.get("prezzo_eur")
             if not name or not sku or not price_raw:
-                log(f"[SKIP] Riga {i}: dati incompleti.")
-                continue
+                log(f"[SKIP] Riga {i}: dati incompleti."); continue
             try:
                 price = float(str(price_raw).replace(",", "."))
             except:
-                log(f"[SKIP] Riga {i}: prezzo non valido.")
-                continue
+                log(f"[SKIP] Riga {i}: prezzo non valido."); continue
 
-            # categoria
             cat_id = None
-            cat_name = (row.get("categoria") or "").strip().lower()
-            if cat_name and col_map:
-                cat_id = col_map.get(cat_name)
+            cat = (row.get("categoria") or "").strip().lower()
+            if cat and col_map:
+                cat_id = col_map.get(cat) or next((v for k, v in col_map.items()
+                         if k.replace(" ", "") == cat.replace(" ", "")), None)
                 if not cat_id:
-                    cat_id = next((v for k, v in col_map.items()
-                                   if k.replace(" ", "") == cat_name.replace(" ", "")), None)
-                    if not cat_id:
-                        log(f"[WARN] Categoria '{row.get('categoria')}' non trovata.")
+                    log(f"[WARN] Categoria '{row.get('categoria')}' non trovata.")
 
-            # cerca esistente per SKU
             existing = None
             try:
                 existing = query_product_by_sku(sku)
@@ -261,25 +277,10 @@ def main():
             try:
                 if existing:
                     pid = existing["id"]
-                    patch = {
-                        "product": {
-                            "id": pid,
-                            "name": (name[:80]),
-                            "description": build_description(row),
-                            "brand": (row.get("brand") or "").strip() or None,
-                            "priceData": {"price": round_price(price)},
-                            "ribbon": "PREORDER",
-                            "tags": ["PREORDER"]
-                        }
-                    }
-                    if cat_id:
-                        patch["product"]["collectionIds"] = [cat_id]
-
-                    r = requests.patch(f"{WIX_API}/products/{pid}", headers=HEADERS,
-                                       data=json.dumps(patch), timeout=60)
-                    if not r.ok:
-                        raise RuntimeError(f"PATCH /products/{pid} failed {r.status_code}: {r.text}")
-
+                    # patch main fields + categorie
+                    patch_product_main(pid, row, price, cat_id)
+                    # forzo le opzioni corrette, poi varianti
+                    force_options(pid)
                     patch_variants(pid, price, sku)
                     try_enable_preorder(pid)
                     add_to_collections(pid, cat_id)
@@ -289,6 +290,7 @@ def main():
                     pid = create_product(row, collection_id=cat_id)
                     if not pid:
                         raise RuntimeError("ID prodotto non ricevuto.")
+                    # varianti e resto
                     patch_variants(pid, price, sku)
                     try_enable_preorder(pid)
                     add_to_collections(pid, cat_id)
@@ -298,8 +300,7 @@ def main():
                 log(f"[ERRORE] Riga {i} '{name}': {e}")
 
     if not created and not updated:
-        print("[ERRORE] Nessun prodotto creato/aggiornato.")
-        sys.exit(2)
+        print("[ERRORE] Nessun prodotto creato/aggiornato."); sys.exit(2)
     print(f"[DONE] Creati: {created}, Aggiornati: {updated}")
     sys.exit(0)
 
