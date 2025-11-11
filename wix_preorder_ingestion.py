@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, csv, os, sys, time, json, re, math
+import argparse, csv, os, sys, time, json, re
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
@@ -11,13 +11,11 @@ API_KEY = os.environ.get("WIX_API_KEY", "").strip()
 SITE_ID = os.environ.get("WIX_SITE_ID", "").strip()
 
 BASE_V1 = "https://www.wixapis.com/stores/v1"
-BASE_V3 = "https://www.wixapis.com/stores/v3"
-
 CURRENCY = "EUR"
 TIMEOUT = 30
 
-# ---------- util http ----------
-def headers():
+# ---------- http ----------
+def _headers():
     if not API_KEY or not SITE_ID:
         print("[ERRORE] Mancano WIX_API_KEY o WIX_SITE_ID nei secrets.", file=sys.stderr)
         sys.exit(2)
@@ -28,16 +26,14 @@ def headers():
     }
 
 def http(method, url, payload=None):
-    r = requests.request(method, url, timeout=TIMEOUT, headers=headers(),
+    r = requests.request(method, url, timeout=TIMEOUT, headers=_headers(),
                          data=json.dumps(payload) if payload is not None else None)
     if r.status_code >= 400:
         raise RuntimeError(f"{method} {url} failed {r.status_code}: {r.text}")
     return r.json() if r.text else {}
 
 # ---------- csv ----------
-REQUIRED = ["nome_articolo","prezzo_eur"]
 def parse_csv(path):
-    # auto delimiter ; oppure , e BOM-friendly
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         sample = f.read(8192)
     delimiter = ";" if sample.count(";") >= sample.count(",") else ","
@@ -46,11 +42,8 @@ def parse_csv(path):
         rdr = csv.DictReader(f, delimiter=delimiter)
         if rdr.fieldnames is None:
             raise RuntimeError("CSV senza header")
-        # normalizza header
-        fieldmap = { (h or "").strip().lower(): h for h in rdr.fieldnames }
-        # controlli minimi riga per riga
         for i, r in enumerate(rdr, start=2):
-            row = { k.strip().lower(): (v or "").strip() for k,v in r.items() }
+            row = { (k or "").strip().lower(): (v or "").strip() for k,v in r.items() }
             if not row.get("nome_articolo") or not row.get("prezzo_eur"):
                 print(f"[SKIP] Riga {i}: nome_articolo o prezzo_eur mancante.")
                 continue
@@ -62,122 +55,122 @@ def parse_csv(path):
 
 # ---------- descrizione (basic) ----------
 def fetch_description(url):
-    if not url: return ""
+    if not url:
+        return ""
     try:
         html = requests.get(url, timeout=30).text
         soup = BeautifulSoup(html, "lxml")
-        # heuristics: prendi blocchi di testo “descrittivi”
-        # 1) meta og:description
         meta = soup.select_one('meta[property="og:description"]')
-        if meta and meta.get("content"): return meta["content"].strip()
-        # 2) div/p più lunghi
+        if meta and meta.get("content"):
+            return meta["content"].strip()
         candidates = [t.get_text(" ", strip=True) for t in soup.select("div,section,p,article")]
         candidates = [c for c in candidates if len(c) > 120]
         candidates.sort(key=len, reverse=True)
         if candidates:
-            return candidates[0][:7900]  # margine sotto 8000
+            return candidates[0][:7900]
     except Exception:
         pass
     return ""
 
 # ---------- collections ----------
 def find_collection_by_name(name):
-    # query paginata (limit <= 100) V1
-    cursor = None
+    if not name:
+        return None
     url = f"{BASE_V1}/collections/query"
+    cursor = None
+    wanted = name.strip().lower()
     while True:
         body = {"query": {"paging": {"limit": 100}}}
         if cursor:
             body["query"]["cursorPaging"] = {"cursor": cursor}
-        try:
-            data = http("POST", url, body)
-        except RuntimeError as e:
-            # se capita limite >100, viene corretto sopra; ogni altro 4xx lo propaghiamo
-            raise
-        colls = data.get("collections", [])
-        for c in colls:
-            if c.get("name","").strip().lower() == name.strip().lower():
+        data = http("POST", url, body)
+        items = data.get("collections", []) or data.get("items", [])
+        for c in items:
+            if c.get("name","").strip().lower() == wanted:
                 return c.get("id")
         cursor = data.get("pagingMetadata", {}).get("cursors", {}).get("next")
         if not cursor:
             return None
 
 def add_product_to_collection(product_id, collection_id):
-    if not collection_id: return
+    if not collection_id:
+        return
     url = f"{BASE_V1}/collections/{collection_id}/products/add"
     http("POST", url, {"productIds": [product_id]})
 
 # ---------- create product ----------
 def build_product_payload_v1(row):
-    name = row.get("nome_articolo","")
-    price = float(row.get("prezzo_eur","0").replace(",", "."))
+    full_name = row.get("nome_articolo","").strip()
+    # Wix V1: max 80 caratteri per name
+    name80 = full_name[:80]
+
+    # prezzo
+    try:
+        price = float(row.get("prezzo_eur","0").replace(",", "."))
+    except:
+        price = 0.0
+
     sku = row.get("sku","").strip()
     brand = row.get("brand","").strip() or None
-    peso = row.get("peso_kg","").replace(",",".")
-    peso_val = float(peso) if peso else None
-    link_distributore = row.get("link_url_distributore","")
+    url_distrib = row.get("url_produttore") or row.get("link_url_distributore") or row.get("url") or ""
+    descr_raw = fetch_description(url_distrib).strip() or row.get("descrizione","").strip()
 
-    # descrizione: URL -> fallback CSV -> stringa vuota
-    descr_raw = fetch_description(link_distributore).strip()
-    if not descr_raw:
-        descr_raw = row.get("descrizione","").strip()
+    # opzionali dal CSV se già presenti con i nomi del tuo v7
+    eta = row.get("eta") or row.get("eta_trimestre") or row.get("eta_raw") or ""
+    deadline = row.get("preorder_scadenza") or row.get("deadline_preordine") or row.get("deadline_raw") or ""
 
-    # ETA/Deadline opzionali (se nel CSV)
-    eta = row.get("eta_trimestre","").strip()  # es. "Q3 - Q4 2026"
-    deadline = row.get("deadline_preordine","").strip()  # es. "31/01/2026"
-    intro = ""
-    if eta or deadline:
-        parts = []
-        if eta: parts.append(f"ETA: {eta}")
-        if deadline: parts.append(f"Deadline preordine: {deadline}")
-        intro = "**" + " | ".join(parts) + "**\n\n"
+    intro_parts = []
+    if eta: intro_parts.append(f"ETA: {eta}")
+    if deadline: intro_parts.append(f"Deadline preordine: {deadline}")
+    intro = ("**" + " | ".join(intro_parts) + "**\n\n") if intro_parts else ""
 
-    # evita backslash dentro f-string
-    descr_html = "<div><p>" + (intro + descr_raw).replace("\n","<br>") + "</p></div>"
+    desc_html = "<div><p>" + (intro + (descr_raw or "")).replace("\n","<br>") + "</p></div>"
+
+    # slug: uso il nome tagliato + suffisso sku se presente per univocità
+    base_slug = slugify(name80)
+    if sku:
+        base_slug = f"{base_slug}-{slugify(sku)}"
 
     product = {
-        "name": name,
-        "slug": slugify(name),
+        "name": name80,
+        "slug": base_slug,
         "visible": True,
         "productType": "physical",
-        "description": descr_html,
-        "priceData": {"currency": CURRENCY, "price": price},
+        "description": desc_html,
+        "priceData": {"currency": CURRENCY, "price": round(price, 2)},
         "manageVariants": True,
         "productOptions": [
             {
                 "name": "PREORDER PAYMENTS OPTIONS*",
                 "choices": [
-                    {"description": "ANTICIPO/SALDO"},
-                    {"description": "PAGAMENTO ANTICIPATO"},
+                    {"value": "ANTICIPO/SALDO", "description": "Pagamento con acconto 30% e saldo alla consegna"},
+                    {"value": "PAGAMENTO ANTICIPATO", "description": "Pagamento anticipato con sconto 5%"}
                 ],
             }
         ],
         "ribbon": "PREORDER",
-        "brand": brand if brand else "",
         "seoData": {
-            "title": name,
+            "title": full_name[:300],
             "description": (descr_raw[:300] if descr_raw else ""),
         },
     }
-    # peso: se presente spostiamolo nei physicalProperties solo dopo creazione (alcuni siti sono schizzinosi)
+    if brand:
+        product["brand"] = brand
     return product, sku, price
 
 def create_product_v1(product):
-    # alcuni siti richiedono wrapper {"product": {...}}
     url = f"{BASE_V1}/products"
     try:
         data = http("POST", url, {"product": product})
         return data.get("id")
     except RuntimeError as e:
         msg = str(e)
-        if "Expected an object" in msg or "unsupported" in msg:
-            # riprova senza wrapper
+        if "Expected an object" in msg:
             data = http("POST", url, product)
             return data.get("id")
         raise
 
 def patch_variants_v1(product_id, sku_base, price_eur):
-    # calcoli prezzo: AS = 30% del prezzo, PA = prezzo * 95%
     as_price = round(price_eur * 0.30, 2)
     pa_price = round(price_eur * 0.95, 2)
     body = {
@@ -203,7 +196,7 @@ def patch_variants_v1(product_id, sku_base, price_eur):
 def run(csv_path):
     rows = parse_csv(csv_path)
 
-    # sanity check API e visibilità prodotti (reader v1)
+    # precheck soft
     try:
         probe = http("POST", f"{BASE_V1}/products/query", {"query": {"paging": {"limit": 5}}})
         vis = len([p for p in probe.get("products", []) if p.get("visible")])
@@ -218,24 +211,23 @@ def run(csv_path):
         try:
             product, sku, price = build_product_payload_v1(row)
             product_id = create_product_v1(product)
-
             if not product_id:
                 raise RuntimeError("ID prodotto non ricevuto.")
 
-            # assegna alla collection (se presente nel CSV)
-            coll_name = row.get("categoria_wix","").strip()
-            if coll_name:
+            # categoria dal CSV (accetta 'categoria' o 'categoria_wix')
+            cat_name = (row.get("categoria") or row.get("categoria_wix") or "").strip()
+            if cat_name:
                 try:
-                    coll_id = find_collection_by_name(coll_name)
+                    coll_id = find_collection_by_name(cat_name)
                     if coll_id:
                         add_product_to_collection(product_id, coll_id)
-                        print(f"[INFO] Assegnato a collection '{coll_name}'")
+                        print(f"[INFO] Assegnato a collection '{cat_name}'")
                     else:
-                        print(f"[WARN] Collection '{coll_name}' non trovata, il prodotto non sarà categorizzato.")
+                        print(f"[WARN] Collection '{cat_name}' non trovata, il prodotto non sarà categorizzato.")
                 except Exception as e:
                     print(f"[WARN] Collection assign: {e}")
 
-            # patch varianti con prezzi AS/PA
+            # varianti con prezzi corretti
             try:
                 patch_variants_v1(product_id, sku, price)
             except Exception as e:
