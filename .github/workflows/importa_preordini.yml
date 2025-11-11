@@ -1,16 +1,24 @@
-name: Importa Preordini (manual)
+name: Importa Preordini (CSV -> Wix)
 
 on:
   workflow_dispatch:
     inputs:
-      csv_path:
-        description: "Percorso CSV (es. input/template_preordini_v7.csv)"
+      csv:
+        description: "Nome del file CSV dentro la cartella input/ (es: template_preordini_v7.csv)"
         required: true
-        default: "input/template_preordini_v7.csv"
+        default: "template_preordini_v7.csv"
 
 jobs:
-  run:
+  importa-preordini:
     runs-on: ubuntu-latest
+
+    env:
+      # Secrets richiesti (impostali in Repo → Settings → Secrets and variables → Actions)
+      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+      # Costruiamo il percorso finale con prefisso 'input/'
+      CSV_BASENAME: ${{ inputs.csv }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,22 +26,43 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps (requests, bs4, lxml, playwright)
+      - name: Installa dipendenze Python
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml openpyxl playwright
-          python -m playwright install --with-deps chromium
+          pip install requests beautifulsoup4 lxml
 
-      - name: Echo inputs
-        run: |
-          echo "CSV=${{ github.event.inputs.csv_path }}"
-
-      - name: Run importer
-        env:
-          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+      - name: Verifica CSV e mostra anteprima
+        shell: bash
         run: |
           set -e
-          python wix_preorder_ingestion.py --csv "${{ github.event.inputs.csv_path }}"
+          CSV_PATH="input/${CSV_BASENAME}"
+          echo "Percorso CSV: ${CSV_PATH}"
+          if [ ! -f "${CSV_PATH}" ]; then
+            echo "ERRORE: file non trovato: ${CSV_PATH}"
+            exit 1
+          fi
+          echo "Prime 5 righe:"
+          head -n 5 "${CSV_PATH}" || true
+
+      # Precheck facoltativo: prova che l'API risponda (non fallisce il job se 403)
+      - name: Precheck API (facoltativo)
+        shell: bash
+        run: |
+          echo "Precheck: query prodotti (non blocca se fallisce)"
+          curl -sS -X POST "https://www.wixapis.com/stores/v1/products/query" \
+            -H "Authorization: ${WIX_API_KEY}" \
+            -H "wix-site-id: ${WIX_SITE_ID}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":{"paging":{"limit":1}}}' \
+            || true
+          echo ""
+          echo "Se qui compare 403, controlla i permessi della chiave API (Stores Read/Write)."
+
+      - name: Importa preordini
+        shell: bash
+        run: |
+          set -e
+          CSV_PATH="input/${CSV_BASENAME}"
+          python wix_preorder_ingestion.py --csv "${CSV_PATH}"
