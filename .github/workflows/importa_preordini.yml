@@ -7,6 +7,7 @@ on:
     paths:
       - "input/template_preordini_v7.csv"
       - "wix_preorder_ingestion.py"
+      - ".github/workflows/importa_preordini.yml"
 
 jobs:
   importa:
@@ -25,10 +26,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Preflight Wix auth
+        env:
+          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}   # oppure ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+        run: |
+          set -e
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: $WIX_AUTH_HEADER" \
+            -H "wix-site-id: $WIX_SITE_ID" \
+            -H "Content-Type: application/json" \
+            "https://www.wixapis.com/stores/v1/collections?limit=1")
+          echo "HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "Preflight fallito. Controlla WIX_AUTH_HEADER e WIX_SITE_ID"; exit 2; fi
+
       - name: Esegui import
         env:
-          WIX_API_BASE: ${{ secrets.WIX_API_BASE }}
-          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
+          WIX_API_BASE: https://www.wixapis.com
+          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}   # oppure ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
           CSV_PATH: input/template_preordini_v7.csv
         run: |
