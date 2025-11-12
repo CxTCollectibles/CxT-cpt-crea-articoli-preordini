@@ -12,15 +12,14 @@ import requests
 
 API = "https://www.wixapis.com"
 
-# Endpoints usati (tutti Stores v1)
-EP_PRODUCTS_CREATE = f"{API}/stores/v1/products"
-EP_PRODUCT_PATCH   = f"{API}/stores/v1/products/{{pid}}"
-EP_PRODUCTS_QUERY  = f"{API}/stores/v1/products/query"
-
+# Endpoints Stores v1
+EP_PRODUCTS_CREATE   = f"{API}/stores/v1/products"
+EP_PRODUCT_PATCH     = f"{API}/stores/v1/products/{{pid}}"
+EP_PRODUCTS_QUERY    = f"{API}/stores/v1/products/query"
 EP_COLLECTIONS_QUERY = f"{API}/stores/v1/collections/query"
 EP_COLLECTION_ADD    = f"{API}/stores/v1/collections/{{cid}}/products/add"
 
-# Colonne attese dal tuo CSV V7
+# Colonne richieste dal CSV V7
 REQUIRED_COLS = [
     "nome_articolo",
     "prezzo_eur",
@@ -73,7 +72,7 @@ def read_csv(path: str) -> List[Dict[str, str]]:
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
         sample = fh.read(4096)
         fh.seek(0)
-        # Sniff delimitatore ; o ,
+        # prova sniff ; oppure ,
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=";,")
         except Exception:
@@ -102,12 +101,10 @@ def patch(url: str, payload: Dict[str, Any]) -> requests.Response:
     return requests.patch(url, headers=headers(), json=payload, timeout=30)
 
 def query_product_by_sku(sku: str) -> Optional[Dict[str, Any]]:
-    """Cerca il prodotto per SKU con l'endpoint ufficiale di query."""
+    """Cerca il prodotto per SKU con la query ufficiale (evita 404/scan)."""
     payload = {
         "query": {
-            "filter": {
-                "sku": str(sku)  # forziamo stringa
-            },
+            "filter": {"sku": str(sku)},
             "paging": {"limit": 1}
         }
     }
@@ -140,6 +137,8 @@ def add_to_collection(pid: str, cid: str) -> None:
     r = post(EP_COLLECTION_ADD.format(cid=cid), {"productIds": [pid]})
     if r.status_code != 200:
         print(f"[WARN] Aggancio categoria fallito: {r.status_code} {r.text[:160]}")
+    else:
+        print(f"[INFO] Assegnato a collection id={cid}")
 
 def make_product_payload(row: Dict[str, str]) -> Dict[str, Any]:
     name = short_name(row.get("nome_articolo", ""))
@@ -154,7 +153,8 @@ def make_product_payload(row: Dict[str, str]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "product": {
             "name": name,
-            "productType": "physical",       # enum accettato: physical | digital
+            "visible": True,
+            "productType": "physical",
             "sku": sku,
             "description": descr_html,
             "ribbon": "PREORDER",
@@ -165,12 +165,54 @@ def make_product_payload(row: Dict[str, str]) -> Dict[str, Any]:
         payload["product"]["brand"] = brand
     return payload
 
+def calc_variants(base_price: float) -> List[Dict[str, Any]]:
+    # ANTICIPO/SALDO = 30% del prezzo base
+    anticipo = round(base_price * 0.30, 2)
+    # PAGAMENTO ANTICIPATO = -5% sul prezzo base
+    anticipato = round(base_price * 0.95, 2)
+
+    option_name = "PREORDER PAYMENTS OPTIONS*"
+    return [
+        {
+            "choices": {option_name: "ANTICIPO/SALDO"},
+            "priceData": {"price": anticipo},
+            "visible": True
+        },
+        {
+            "choices": {option_name: "PAGAMENTO ANTICIPATO"},
+            "priceData": {"price": anticipato},
+            "visible": True
+        },
+    ]
+
+def apply_variants(pid: str, base_price: float) -> None:
+    option_name = "PREORDER PAYMENTS OPTIONS*"
+    payload = {
+        "product": {
+            "productOptions": [
+                {
+                    "name": option_name,
+                    "choices": [
+                        {"value": "ANTICIPO/SALDO"},
+                        {"value": "PAGAMENTO ANTICIPATO"},
+                    ],
+                }
+            ],
+            # Definiamo direttamente le varianti complete (così "variants managed")
+            "variants": calc_variants(base_price),
+        }
+    }
+    r = patch(EP_PRODUCT_PATCH.format(pid=pid), payload)
+    if r.status_code != 200:
+        raise RuntimeError(f"PATCH varianti fallita: {r.status_code} {r.text[:200]}")
+
 def upsert_row(row: Dict[str, str]) -> str:
     name = short_name(row.get("nome_articolo", ""))
     sku  = (row.get("sku") or "").strip()
     cat  = (row.get("categoria") or "").strip()
+    price = to_price(row.get("prezzo_eur", ""))
 
-    # Proviamo prima a creare
+    # Proviamo la creazione
     payload = make_product_payload(row)
     r = post(EP_PRODUCTS_CREATE, payload)
     if r.status_code == 200:
@@ -181,7 +223,7 @@ def upsert_row(row: Dict[str, str]) -> str:
             raise RuntimeError("ID prodotto non ricevuto.")
         print(f"[NEW] {name} (SKU={sku})")
     else:
-        # Se SKU duplicato, cerchiamo il prodotto e facciamo PATCH
+        # SKU duplicato? Aggiorniamo quel prodotto
         txt = (r.text or "").lower()
         if r.status_code == 400 and "sku is not unique" in txt:
             existing = query_product_by_sku(sku)
@@ -190,16 +232,25 @@ def upsert_row(row: Dict[str, str]) -> str:
             pid = existing.get("id")
             r2 = patch(EP_PRODUCT_PATCH.format(pid=pid), payload)
             if r2.status_code != 200:
-                raise RuntimeError(f"PATCH fallita: {r2.status_code} {r2.text}")
+                raise RuntimeError(f"PATCH fallita: {r2.status_code} {r2.text[:200]}")
             print(f"[UPD] {name} (SKU={sku})")
         else:
-            raise RuntimeError(f"POST fallita: {r.status_code} {r.text}")
+            raise RuntimeError(f"POST fallita: {r.status_code} {r.text[:200]}")
+
+    # Varianti con prezzi corretti
+    try:
+        apply_variants(pid, price)
+        print(f"[OK] Varianti create: ANTICIPO/SALDO={round(price*0.30,2)}  PAGAMENTO ANTICIPATO={round(price*0.95,2)}")
+    except Exception as e:
+        print(f"[WARN] Varianti non applicate: {e}")
 
     # Categoria (best-effort)
     if cat:
         cid = find_collection_id(cat)
         if cid:
             add_to_collection(pid, cid)
+        else:
+            print(f"[WARN] Categoria non agganciata: '{cat}'")
 
     return pid
 
