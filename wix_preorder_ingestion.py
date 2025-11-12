@@ -25,8 +25,6 @@ HEADERS = {
     "wix-site-id": WIX_SITE_ID,
 }
 
-# -------- Helpers di rete/log
-
 def log(msg: str):
     print(msg, flush=True)
 
@@ -46,20 +44,19 @@ def req(method: str, path: str, body: Optional[dict] = None, ok=(200,), headers=
             return {}
     return {}
 
-# -------- Normalizzazione CSV
+# ---------- CSV mapping (tollerante)
 
 HEADER_ALIASES: Dict[str, list] = {
-    "nome_articolo": ["nome_articolo", "titolo", "titolo_articolo", "name", "product_name"],
-    "prezzo_eur": ["prezzo_eur", "prezzo", "price", "price_eur", "prezzo_ivato"],
-    "sku": ["sku", "codice_sku", "codice", "codice_prodotto", "product_code"],
-    "brand": ["brand", "marchio", "marca"],
-    "categoria": ["categoria", "collezione", "collection", "categoria_wix"],
-    "descrizione": ["descrizione", "description", "descrizione_en", "descrizione_it", "desc"],
-    "preorder_deadline": ["preorder_deadline", "scadenza_preordine", "deadline_preordine", "deadline", "preorder_scadenza"],
-    "eta": ["eta", "uscita_prevista", "release_eta", "data_uscita", "eta_release"],
+    "nome_articolo": ["nome_articolo","titolo","titolo_articolo","name","product_name"],
+    "prezzo_eur": ["prezzo_eur","prezzo","price","price_eur","prezzo_ivato"],
+    "sku": ["sku","codice_sku","codice","codice_prodotto","product_code"],
+    "brand": ["brand","marchio","marca"],
+    "categoria": ["categoria","collezione","collection","categoria_wix"],
+    "descrizione": ["descrizione","description","descrizione_en","descrizione_it","desc"],
+    "preorder_deadline": ["preorder_deadline","scadenza_preordine","deadline_preordine","deadline","preorder_scadenza"],
+    "eta": ["eta","uscita_prevista","release_eta","data_uscita","eta_release"],
 }
-
-REQUIRED_MIN = ["nome_articolo", "prezzo_eur", "sku"]  # il resto è opzionale
+REQUIRED_MIN = ["nome_articolo","prezzo_eur","sku"]
 
 def pick_header(fieldnames, wanted_list):
     fset = { (f or "").strip().lower(): f for f in fieldnames if f is not None }
@@ -71,18 +68,12 @@ def pick_header(fieldnames, wanted_list):
 
 def read_csv(path: str):
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
-        # forzo ; come da tuo template
         rdr = csv.DictReader(fh, delimiter=';')
         if not rdr.fieldnames:
             raise RuntimeError("CSV senza intestazioni.")
-
-        # mappa alias -> colonna reale
         selected = {}
         for canon, aliases in HEADER_ALIASES.items():
-            real = pick_header(rdr.fieldnames, aliases)
-            selected[canon] = real
-
-        # verifica minimi
+            selected[canon] = pick_header(rdr.fieldnames, aliases)
         missing_min = [c for c in REQUIRED_MIN if not selected.get(c)]
         if missing_min:
             raise RuntimeError(f"CSV mancano colonne minime: {missing_min}")
@@ -98,7 +89,7 @@ def read_csv(path: str):
                 row[canon] = (raw.get(col) if col else "") or ""
             yield i, row
 
-# -------- Formattazioni
+# ---------- formattazioni
 
 def sanitize_name(n: str) -> str:
     n = (n or "").strip()
@@ -128,13 +119,10 @@ def eta_to_quarters(eta_text: str) -> str:
     t = eta_text.lower()
     for k, v in m_map.items():
         if k in t:
-            try:
-                m = int(v)
-                q = mesi_q[m]
-                nxt = {"Q1":"Q2","Q2":"Q3","Q3":"Q4","Q4":"Q1"}[q]
-                return f"{q} - {nxt}"
-            except Exception:
-                break
+            m = int(v)
+            q = mesi_q[m]
+            nxt = {"Q1":"Q2","Q2":"Q3","Q3":"Q4","Q4":"Q1"}[q]
+            return f"{q} - {nxt}"
     return eta_text
 
 def build_description(deadline: str, eta: str, descr: str) -> str:
@@ -144,17 +132,17 @@ def build_description(deadline: str, eta: str, descr: str) -> str:
     if eta:
         parts.append(f"<p><strong>ETA:</strong> {html.escape(eta_to_quarters(eta))}</p>")
     if parts:
-        parts.append("<p>&nbsp;</p>")  # riga vuota
+        parts.append("<p>&nbsp;</p>")  # separatore linea vuota
     if descr:
         safe = html.escape(descr)
-        safe = safe.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+        safe = safe.replace("\r\n","\n").replace("\r","\n").replace("\n","<br>")
         parts.append(f"<p>{safe}</p>")
     return "<div>" + "".join(parts) + "</div>"
 
-# -------- API catalogo
+# ---------- categorie
 
 def get_collections_map() -> Dict[str, str]:
-    # Prova GET, poi POST /query
+    # tenta GET, se fallisce usa POST /query
     try:
         res = req("GET", "/stores/v1/collections?limit=100", None, ok=(200,))
         items = res.get("collections", []) or res.get("items", []) or []
@@ -173,7 +161,7 @@ def get_collections_map() -> Dict[str, str]:
 def find_product_by_sku(sku: str) -> Optional[str]:
     if not sku:
         return None
-    # Tentativo 1
+    # filtro semplice
     try:
         body = {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}}
         res = req("POST", "/stores/v1/products/query", body, ok=(200,))
@@ -182,7 +170,7 @@ def find_product_by_sku(sku: str) -> Optional[str]:
             return items[0].get("id")
     except Exception:
         pass
-    # Tentativo 2 ($eq)
+    # variante con $eq
     try:
         body = {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}}
         res = req("POST", "/stores/v1/products/query", body, ok=(200,))
@@ -193,11 +181,13 @@ def find_product_by_sku(sku: str) -> Optional[str]:
         pass
     return None
 
-# -------- Creazione/Aggiornamento prodotto
+# ---------- brand
 
-def ensure_brand(brand_name: str) -> Dict[str, Any]:
+def normalize_brand(brand_name: str) -> Optional[str]:
     b = (brand_name or "").strip()
-    return {"name": b} if b else {}
+    return b if b else None
+
+# ---------- core create/update
 
 def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: Dict[str,str]):
     name_raw = (row.get("nome_articolo") or "").strip()
@@ -207,7 +197,7 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
         return
 
     sku = (row.get("sku") or "").strip()
-    brand = (row.get("brand") or "").strip()
+    brand = normalize_brand(row.get("brand") or "")
     categoria = (row.get("categoria") or "").strip()
     descr = (row.get("descrizione") or "").strip()
     deadline = (row.get("preorder_deadline") or "").strip()
@@ -217,36 +207,36 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
     slug = mk_slug(name, sku)
     description_html = build_description(deadline, eta, descr)
 
-    # productType numerico per compatibilità (1 = physical)
-    product_payload = {
-        "product": {
-            "name": name,
-            "slug": slug,
-            "productType": 1,
-            "priceData": {"price": price},
-            "sku": sku,
-            "description": description_html,
-            "ribbon": "PREORDER",
-            "brand": ensure_brand(brand),
-            "manageVariants": True,
-            "productOptions": [
-                {
-                    "name": "PREORDER PAYMENTS OPTIONS*",
-                    "choices": [
-                        {
-                            "value": "ANTICIPO/SALDO",
-                            "description": f"Acconto 30%: €{fmt_money(price*0.30)} | Saldo alla consegna"
-                        },
-                        {
-                            "value": "PAGAMENTO ANTICIPATO",
-                            "description": f"Sconto 5%: €{fmt_money(price*0.95)}"
-                        }
-                    ]
-                }
-            ],
-            "visible": True
-        }
+    product_core = {
+        "name": name,
+        "slug": slug,
+        "productType": "physical",     # stringa, non numero
+        "priceData": {"price": price},
+        "sku": sku,
+        "description": description_html,
+        "ribbon": "PREORDER",
+        "manageVariants": True,
+        "productOptions": [
+            {
+                "name": "PREORDER PAYMENTS OPTIONS*",
+                "choices": [
+                    {
+                        "value": "ANTICIPO/SALDO",
+                        "description": f"Acconto 30%: €{fmt_money(price*0.30)} | Saldo alla consegna"
+                    },
+                    {
+                        "value": "PAGAMENTO ANTICIPATO",
+                        "description": f"Sconto 5%: €{fmt_money(price*0.95)}"
+                    }
+                ]
+            }
+        ],
+        "visible": True
     }
+    if brand:
+        product_core["brand"] = brand  # stringa semplice per v1
+
+    product_payload = {"product": product_core}
 
     existing_id = find_product_by_sku(sku)
 
@@ -267,7 +257,7 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
         if not product_id:
             raise RuntimeError("ID prodotto non ricevuto.")
 
-    # Varianti: prezzi specifici per le due scelte
+    # Varianti con prezzi specifici
     try:
         variant_body = {
             "variants": [
@@ -292,8 +282,8 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
         if coll_id:
             try:
                 body = {"productIds": [product_id]}
-                # endpoint add by ids
-                req("POST", f"/stores/v1/collections/{coll_id}/productIds", body, ok=(200,204))
+                # endpoint corretto per aggiungere prodotti alla collezione
+                req("POST", f"/stores/v1/collections/{coll_id}/products/add", body, ok=(200,))
                 log(f"[INFO] Assegnato a collection '{categoria}'")
             except Exception as e:
                 log(f"[WARN] Assegnazione categoria '{categoria}' fallita: {e}")
@@ -301,8 +291,6 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
             log(f"[WARN] Collection '{categoria}' non trovata, il prodotto non sarà categorizzato.")
 
     log(f"[OK] Riga {rownum} '{name}' creato/aggiornato (SKU={sku})")
-
-# -------- main
 
 def precheck():
     if not WIX_API_KEY or not WIX_SITE_ID:
@@ -314,15 +302,10 @@ def precheck():
         log(f"[WARN] Precheck prodotti con v1/query fallito: {e}")
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1].strip():
-        csv_path = sys.argv[1].strip()
-    else:
-        csv_path = "input/template_preordini_v7.csv"
-
+    csv_path = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else "input/template_preordini_v7.csv"
     log(f"[INFO] CSV: {csv_path}")
     precheck()
 
-    # categorie
     try:
         collections = get_collections_map()
         if collections:
