@@ -1,0 +1,69 @@
+name: Diagnostica Wix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    env:
+      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}      # deve essere 7368e0dc-42db-4085-8a93-c0870ade7ec8
+      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}      # solo la key, non tutto l'header
+    steps:
+      - name: Echo inputs (oscurati)
+        run: |
+          echo "SITE_ID len: ${#WIX_SITE_ID}"
+          echo "API_KEY  len: ${#WIX_API_KEY}"
+          # stampa in hex gli ultimi 4 byte per beccare CR/LF invisibili
+          python3 - << 'PY'
+import os, binascii
+for k in ("WIX_SITE_ID","WIX_API_KEY"):
+    v=os.environ.get(k,"")
+    print(f"{k} tail-hex:", binascii.hexlify(v.encode()[-8:]).decode())
+PY
+
+      - name: Build header e mostra hex (per scovare newline)
+        run: |
+          AUTH_HEADER="Authorization: ${WIX_API_KEY}"
+          echo "::group::Header debug"
+          printf '%s\n' "$AUTH_HEADER" | hexdump -C
+          echo "::endgroup::"
+          echo "AUTH_HEADER len: ${#AUTH_HEADER}"
+          echo "SITE_ID: ${WIX_SITE_ID}"
+
+          # salva per riuso
+          echo "AUTH_HEADER=$AUTH_HEADER" >> $GITHUB_ENV
+
+      - name: Preflight 1 - stores/v1/products
+        run: |
+          set -x
+          curl -i -sS -o /dev/null -w "HTTP %{http_code}\n" \
+            -H "${AUTH_HEADER}" \
+            -H "wix-site-id: ${WIX_SITE_ID}" \
+            "https://www.wixapis.com/stores/v1/products?limit=1"
+
+      - name: Preflight 2 - stores-reader/v1/products
+        run: |
+          set -x
+          curl -i -sS -o /dev/null -w "HTTP %{http_code}\n" \
+            -H "${AUTH_HEADER}" \
+            -H "wix-site-id: ${WIX_SITE_ID}" \
+            "https://www.wixapis.com/stores-reader/v1/products?limit=1"
+
+      - name: Preflight 3 - stores/v1/collections
+        run: |
+          set -x
+          curl -i -sS -o /dev/null -w "HTTP %{http_code}\n" \
+            -H "${AUTH_HEADER}" \
+            -H "wix-site-id: ${WIX_SITE_ID}" \
+            "https://www.wixapis.com/stores/v1/collections?limit=1"
+
+      - name: Preflight 4 - stores/v1/products/query (POST vuoto valido)
+        run: |
+          set -x
+          curl -i -sS -o /dev/null -w "HTTP %{http_code}\n" \
+            -H "${AUTH_HEADER}" \
+            -H "wix-site-id: ${WIX_SITE_ID}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":{}}' \
+            "https://www.wixapis.com/stores/v1/products/query"
