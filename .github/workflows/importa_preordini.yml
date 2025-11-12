@@ -1,21 +1,18 @@
-name: Importa Preordini (manual)
+name: Importa Preordini CPT
 
 on:
   workflow_dispatch:
-    inputs:
-      csv_path:
-        description: "Percorso CSV (relativo alla root repo)"
-        required: false
-        default: "input/template_preordini_v7.csv"
+  push:
+    branches: [ main ]
+    paths:
+      - "input/template_preordini_v7.csv"
+      - "wix_preorder_ingestion.py"
 
 jobs:
-  run:
+  importa:
     runs-on: ubuntu-latest
-    env:
-      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -26,12 +23,13 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-slugify unidecode
+          pip install requests
 
-      - name: Run importer
-        shell: bash
+      - name: Esegui import
+        env:
+          WIX_API_BASE: ${{ secrets.WIX_API_BASE }}
+          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
+          CSV_PATH: input/template_preordini_v7.csv
         run: |
           set -e
-          CSV_PATH="${{ github.event.inputs.csv_path }}"
-          echo "[INFO] CSV: $CSV_PATH"
-          python3 wix_preorder_ingestion.py "$CSV_PATH"
+          python3 wix_preorder_ingestion.py
