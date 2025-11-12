@@ -1,41 +1,263 @@
-name: Importa preordini (CSV v7)
+name: Importa Preordini (Baseline)
 
 on:
   workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Percorso CSV V7 (es. input/template_preordini_v7.csv)"
+        required: true
+        default: "input/template_preordini_v7.csv"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-      CSV_PATH: input/template_preordini_v7.csv
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+        run: pip install requests
 
-      - name: Precheck env
+      - name: Write wix_preorder_ingestion.py (baseline)
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, sys
-          miss=[k for k in ("WIX_API_KEY","WIX_SITE_ID","CSV_PATH") if not os.getenv(k)]
-          if miss:
-              print("Mancano variabili:", miss); sys.exit(2)
-          print("Env OK")
+          cat > wix_preorder_ingestion.py << 'PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+
+          import csv
+          import html
+          import os
+          import sys
+          from typing import Any, Dict, List, Optional
+
+          import requests
+
+          API = "https://www.wixapis.com"
+          EP_PRODUCTS = f"{API}/stores/v1/products"
+          EP_PRODUCT = f"{API}/stores/v1/products/{{pid}}"
+          EP_PRODUCTS_LIST = f"{API}/stores/v1/products"
+          EP_COLLECTIONS_QUERY = f"{API}/stores/v1/collections/query"
+          EP_COLLECTION_ADD = f"{API}/stores/v1/collections/{{cid}}/products/add"
+
+          # Colonne richieste dal CSV V7
+          REQUIRED_COLS = [
+              "nome_articolo",
+              "prezzo_eur",
+              "sku",
+              "brand",
+              "categoria",
+              "descrizione",
+              "preorder_scadenza",
+              "eta",
+          ]
+
+          def need_env(name: str) -> str:
+              v = os.getenv(name, "").strip()
+              if not v:
+                  print(f"[FATAL] Variabile {name} mancante.")
+                  sys.exit(2)
+              return v
+
+          def headers() -> Dict[str, str]:
+              return {
+                  "Authorization": need_env("WIX_API_KEY"),
+                  "wix-site-id": need_env("WIX_SITE_ID"),
+                  "Content-Type": "application/json",
+              }
+
+          def to_price(s: str) -> float:
+              s = (s or "").replace("€", "").replace(",", ".").strip()
+              try:
+                  return round(float(s), 2)
+              except Exception:
+                  return 0.0
+
+          def short_name(name: str) -> str:
+              name = (name or "").strip()
+              if len(name) > 80:
+                  print("[WARN] Nome > 80 caratteri, troncato.")
+                  name = name[:80]
+              return name
+
+          def build_description(deadline: str, eta: str, body: str) -> str:
+              # Riga vuota tra ETA e corpo
+              raw = f"PREORDER DEADLINE: {deadline}\nETA: {eta}\n\n{body or ''}".strip()
+              esc = html.escape(raw).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+              return f"<div><p>{esc}</p></div>"
+
+          def read_csv(path: str) -> List[Dict[str, str]]:
+              if not os.path.isfile(path):
+                  print(f"[FATAL] CSV non trovato: {path}")
+                  sys.exit(2)
+              with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+                  sample = fh.read(4096)
+                  fh.seek(0)
+                  try:
+                      dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+                  except Exception:
+                      class D(csv.Dialect):
+                          delimiter = ';'
+                          quotechar = '"'
+                          doublequote = True
+                          skipinitialspace = False
+                          lineterminator = '\n'
+                          quoting = csv.QUOTE_MINIMAL
+                      dialect = D
+                  r = csv.DictReader(fh, dialect=dialect)
+                  cols = [c.strip() for c in (r.fieldnames or [])]
+                  missing = [c for c in REQUIRED_COLS if c not in cols]
+                  if missing:
+                      raise RuntimeError(f"CSV mancano colonne: {missing}")
+                  rows: List[Dict[str, str]] = []
+                  for row in r:
+                      rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
+                  return rows
+
+          def post_json(url: str, payload: Dict[str, Any]) -> requests.Response:
+              return requests.post(url, headers=headers(), json=payload, timeout=30)
+
+          def patch_json(url: str, payload: Dict[str, Any]) -> requests.Response:
+              return requests.patch(url, headers=headers(), json=payload, timeout=30)
+
+          def get_json(url: str, params: Dict[str, Any]) -> requests.Response:
+              return requests.get(url, headers=headers(), params=params, timeout=30)
+
+          def scan_by_sku(sku: str, max_pages: int = 50) -> Optional[Dict[str, Any]]:
+              # Fallback stabile: scansiona lista prodotti a pagine
+              cursor = None
+              pages = 0
+              while pages < max_pages:
+                  params = {"limit": 100}
+                  if cursor:
+                      params["cursor"] = cursor
+                  r = get_json(EP_PRODUCTS_LIST, params)
+                  if r.status_code != 200:
+                      print(f"[WARN] Scan prodotti pagina {pages+1} fallita: {r.status_code} {r.text[:140]}")
+                      return None
+                  data = r.json() or {}
+                  items = data.get("products") or data.get("items") or []
+                  for it in items:
+                      if (it.get("sku") or "").strip() == sku:
+                          return it
+                  cursor = data.get("nextCursor") or (data.get("metadata") or {}).get("nextCursor")
+                  if not cursor:
+                      break
+                  pages += 1
+              return None
+
+          def find_collection_id(name: str) -> Optional[str]:
+              nm = (name or "").strip()
+              if not nm:
+                  return None
+              r = post_json(EP_COLLECTIONS_QUERY, {"query": {"filter": {}, "paging": {"limit": 100}}})
+              if r.status_code != 200:
+                  print(f"[WARN] Lettura categorie fallita: {r.status_code} {r.text[:160]}")
+                  return None
+              data = r.json() or {}
+              items = data.get("collections") or data.get("items") or []
+              target = nm.lower()
+              for it in items:
+                  if (it.get("name") or "").strip().lower() == target:
+                      return it.get("id") or it.get("_id")
+              print(f"[WARN] Collection '{nm}' non trovata.")
+              return None
+
+          def add_to_collection(pid: str, cid: str) -> None:
+              r = post_json(EP_COLLECTION_ADD.format(cid=cid), {"productIds": [pid]})
+              if r.status_code != 200:
+                  print(f"[WARN] Aggancio categoria fallito: {r.status_code} {r.text[:160]}")
+
+          def upsert(row: Dict[str, str]) -> str:
+              name = short_name(row.get("nome_articolo", ""))
+              price = to_price(row.get("prezzo_eur", ""))
+              sku = (row.get("sku") or "").strip()
+              brand = (row.get("brand") or "").strip()
+              cat = (row.get("categoria") or "").strip()
+              body = row.get("descrizione") or ""
+              deadline = row.get("preorder_scadenza") or ""
+              eta = row.get("eta") or ""
+
+              descr_html = build_description(deadline, eta, body)
+
+              product = {
+                  "name": name,
+                  "productType": 1,  # physical
+                  "sku": sku,
+                  "description": descr_html,
+                  "ribbon": "PREORDER",
+                  "priceData": {"price": price},
+              }
+              if brand:
+                  product["brand"] = brand
+
+              # 1) tenta creazione
+              r = post_json(EP_PRODUCTS, {"product": product})
+              if r.status_code == 200:
+                  data = r.json() or {}
+                  prod = data.get("product") or data
+                  pid = prod.get("id")
+                  if not pid:
+                      raise RuntimeError("ID prodotto non ricevuto.")
+                  print(f"[NEW] {name} (SKU={sku})")
+              else:
+                  txt = (r.text or "").lower()
+                  if r.status_code == 400 and "sku is not unique" in txt:
+                      # 2) cerca prodotto esistente e fai PATCH
+                      ex = scan_by_sku(sku)
+                      if not ex:
+                          raise RuntimeError(f"SKU duplicato ma prodotto non trovato: {sku}")
+                      pid = ex.get("id")
+                      r2 = patch_json(EP_PRODUCT.format(pid=pid), {"product": product})
+                      if r2.status_code != 200:
+                          raise RuntimeError(f"PATCH fallita: {r2.status_code} {r2.text}")
+                      print(f"[UPD] {name} (SKU={sku})")
+                  else:
+                      raise RuntimeError(f"POST fallita: {r.status_code} {r.text}")
+
+              # 3) categoria (best-effort)
+              if cat:
+                  cid = find_collection_id(cat)
+                  if cid:
+                      add_to_collection(pid, cid)
+              return pid
+
+          def main():
+              if len(sys.argv) < 2:
+                  print("Uso: python3 wix_preorder_ingestion.py <CSV_V7>")
+                  sys.exit(2)
+              csv_path = sys.argv[1]
+              rows = read_csv(csv_path)
+
+              created = updated = errors = 0
+              for i, row in enumerate(rows, start=2):
+                  name = short_name(row.get("nome_articolo", ""))
+                  sku = row.get("sku", "")
+                  try:
+                      pid = upsert(row)
+                      # log minimale: NEW/UPD già stampati
+                  except Exception as e:
+                      errors += 1
+                      print(f"[ERRORE] Riga {i} '{name}': {e}")
+
+              print(f"[DONE] Errori: {errors}")
+              if errors:
+                  sys.exit(2)
+
+          if __name__ == "__main__":
+              main()
           PY
+          chmod +x wix_preorder_ingestion.py
 
-      - name: Lancia import
+      - name: Run import
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
         run: |
           set -e
-          python3 wix_preorder_ingestion.py "$CSV_PATH"
+          python3 wix_preorder_ingestion.py "${{ github.event.inputs.csv_path }}"
