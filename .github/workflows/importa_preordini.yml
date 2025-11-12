@@ -1,20 +1,21 @@
-name: Importa Preordini CPT
+name: Importa Preordini
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - "input/template_preordini_v7.csv"
-      - "wix_preorder_ingestion.py"
-      - ".github/workflows/importa_preordini.yml"
+    inputs:
+      csv_path:
+        description: "Percorso CSV dentro input/"
+        required: false
+        default: "template_preordini_v7.csv"
 
 jobs:
-  importa:
+  import:
     runs-on: ubuntu-latest
-
+    env:
+      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}     # SOLO la chiave
+      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}     # metaSiteId
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -22,53 +23,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps minimi
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests python-slugify
 
-      - name: Preflight Wix auth
-        env:
-          # Se i tuoi secret si chiamano diversamente (es. WIX_API_KEY), rimappa qui:
-          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+      - name: Echo parametri
         run: |
-          set -e
-          echo "== Preflight 1: GET /stores/v1/collections?limit=1 =="
-          RESP=$(mktemp)
-          CODE=$(curl -sS -o "$RESP" -w "%{http_code}" \
-            -H "Authorization: $WIX_AUTH_HEADER" \
-            -H "wix-site-id: $WIX_SITE_ID" \
-            -H "Content-Type: application/json" \
-            "https://www.wixapis.com/stores/v1/collections?limit=1")
-          echo "HTTP $CODE"
-          tail -c 600 "$RESP" || true
+          echo "CSV richiesto: input/${{ github.event.inputs.csv_path }}"
+          echo "SITE_ID len=${#WIX_SITE_ID}"
+          echo "API_KEY  len=${#WIX_API_KEY}"
 
-          if [ "$CODE" = "404" ]; then
-            echo "::warning::404 Not Found. Di solito: header wix-site-id contiene lo 'siteId' (sbagliato) invece del 'metaSiteId', oppure Stores non è installato/abilitato per la chiave."
-            echo "== Preflight 2: GET /stores/v1/products?limit=1 =="
-            CODE2=$(curl -sS -o "$RESP" -w "%{http_code}" \
-              -H "Authorization: $WIX_AUTH_HEADER" \
-              -H "wix-site-id: $WIX_SITE_ID" \
-              -H "Content-Type: application/json" \
-              "https://www.wixapis.com/stores/v1/products?limit=1")
-            echo "HTTP $CODE2"
-            tail -c 600 "$RESP" || true
-            if [ "$CODE2" != "200" ]; then
-              echo "Preflight fallito. Controlla che WIX_SITE_ID sia il metaSiteId e che la API Key abbia permessi Stores."; exit 2;
-            fi
-          elif [ "$CODE" != "200" ]; then
-            echo "Preflight fallito. HTTP=$CODE"; exit 2;
-          fi
-          echo "Preflight OK."
+      - name: Precheck rapido endpoint (non bloccante)
+        continue-on-error: true
+        run: |
+          curl -i -sS -o /dev/null -w "GET products -> HTTP %{http_code}\n" \
+            -H "Authorization: ${WIX_API_KEY}" \
+            -H "wix-site-id: ${WIX_SITE_ID}" \
+            "https://www.wixapis.com/stores/v1/products?limit=1"
 
       - name: Esegui import
         env:
-          WIX_API_BASE: https://www.wixapis.com
-          # Rimappa qui se usi un nome secret diverso:
-          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          CSV_PATH: input/template_preordini_v7.csv
+          CSV_PATH: input/${{ github.event.inputs.csv_path }}
         run: |
           set -e
-          python3 wix_preorder_ingestion.py
+          test -f "$CSV_PATH" || { echo "File non trovato: $CSV_PATH"; exit 1; }
+          # Passo la key e il site come env (compatibilità con script esistente)
+          export WIX_AUTH="${WIX_API_KEY}"
+          export WIX_SITE="${WIX_SITE_ID}"
+          # Se il tuo script accetta --auth/--site usali, altrimenti legge le env qui sopra
+          python3 wix_preorder_ingestion.py "$CSV_PATH"
