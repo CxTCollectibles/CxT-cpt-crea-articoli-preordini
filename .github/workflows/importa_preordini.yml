@@ -1,11 +1,11 @@
-name: Importa Preordini (manuale)
+name: Importa Preordini (manual)
 
 on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: "Percorso CSV rispetto alla root del repo"
-        required: true
+        description: "Percorso CSV (relativo alla root repo)"
+        required: false
         default: "input/template_preordini_v7.csv"
 
 jobs:
@@ -21,17 +21,17 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests python-slugify unidecode
 
-      - name: Esegui import
-        env:
-          CSV_PATH: ${{ github.event.inputs.csv_path }}
+      - name: Run importer
+        shell: bash
         run: |
           set -e
-          echo "[INFO] CSV: ${CSV_PATH}"
-          python3 wix_preorder_ingestion.py "${CSV_PATH}"
+          CSV_PATH="${{ github.event.inputs.csv_path }}"
+          echo "[INFO] CSV: $CSV_PATH"
+          python3 wix_preorder_ingestion.py "$CSV_PATH"
