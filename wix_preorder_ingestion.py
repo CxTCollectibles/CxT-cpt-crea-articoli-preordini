@@ -8,7 +8,6 @@ import os
 import re
 import sys
 import time
-from itertools import islice
 from typing import Dict, Any, Optional
 
 import requests
@@ -26,9 +25,9 @@ HEADERS = {
     "wix-site-id": WIX_SITE_ID,
 }
 
-# ---------- Utils
+# -------- Helpers di rete/log
 
-def log(msg):
+def log(msg: str):
     print(msg, flush=True)
 
 def req(method: str, path: str, body: Optional[dict] = None, ok=(200,), headers=None):
@@ -40,12 +39,66 @@ def req(method: str, path: str, body: Optional[dict] = None, ok=(200,), headers=
     r = requests.request(method, url, headers=h, data=data, timeout=30)
     if r.status_code not in ok:
         raise requests.HTTPError(f"{method} {path} failed {r.status_code}: {r.text}")
-    if r.text.strip():
+    if r.text and r.text.strip():
         try:
             return r.json()
         except Exception:
             return {}
     return {}
+
+# -------- Normalizzazione CSV
+
+HEADER_ALIASES: Dict[str, list] = {
+    "nome_articolo": ["nome_articolo", "titolo", "titolo_articolo", "name", "product_name"],
+    "prezzo_eur": ["prezzo_eur", "prezzo", "price", "price_eur", "prezzo_ivato"],
+    "sku": ["sku", "codice_sku", "codice", "codice_prodotto", "product_code"],
+    "brand": ["brand", "marchio", "marca"],
+    "categoria": ["categoria", "collezione", "collection", "categoria_wix"],
+    "descrizione": ["descrizione", "description", "descrizione_en", "descrizione_it", "desc"],
+    "preorder_deadline": ["preorder_deadline", "scadenza_preordine", "deadline_preordine", "deadline", "preorder_scadenza"],
+    "eta": ["eta", "uscita_prevista", "release_eta", "data_uscita", "eta_release"],
+}
+
+REQUIRED_MIN = ["nome_articolo", "prezzo_eur", "sku"]  # il resto è opzionale
+
+def pick_header(fieldnames, wanted_list):
+    fset = { (f or "").strip().lower(): f for f in fieldnames if f is not None }
+    for cand in wanted_list:
+        key = cand.lower()
+        if key in fset:
+            return fset[key]
+    return None
+
+def read_csv(path: str):
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        # forzo ; come da tuo template
+        rdr = csv.DictReader(fh, delimiter=';')
+        if not rdr.fieldnames:
+            raise RuntimeError("CSV senza intestazioni.")
+
+        # mappa alias -> colonna reale
+        selected = {}
+        for canon, aliases in HEADER_ALIASES.items():
+            real = pick_header(rdr.fieldnames, aliases)
+            selected[canon] = real
+
+        # verifica minimi
+        missing_min = [c for c in REQUIRED_MIN if not selected.get(c)]
+        if missing_min:
+            raise RuntimeError(f"CSV mancano colonne minime: {missing_min}")
+
+        log("[INFO] Mappatura colonne:")
+        for k, v in selected.items():
+            log(f"  - {k}: {v or '(assente)'}")
+
+        for i, raw in enumerate(rdr, start=2):
+            row = {}
+            for canon in HEADER_ALIASES.keys():
+                col = selected.get(canon)
+                row[canon] = (raw.get(col) if col else "") or ""
+            yield i, row
+
+# -------- Formattazioni
 
 def sanitize_name(n: str) -> str:
     n = (n or "").strip()
@@ -61,32 +114,24 @@ def mk_slug(name: str, sku: str) -> str:
         return f"{base}-{s}"
     return base or s or str(int(time.time()))
 
-def fmt_money(v: float) -> float:
-    return round(float(v), 2)
+def fmt_money(v) -> float:
+    try:
+        return round(float(v), 2)
+    except Exception:
+        return 0.0
 
 def eta_to_quarters(eta_text: str) -> str:
-    # Intenzione: se è un mese (es. "agosto 2026") mappa a Q3 ecc.
-    # fallback: usa il testo così com'è
     if not eta_text:
         return ""
-    mesi_q = {
-        1:"Q1",2:"Q1",3:"Q1",
-        4:"Q2",5:"Q2",6:"Q2",
-        7:"Q3",8:"Q3",9:"Q3",
-        10:"Q4",11:"Q4",12:"Q4"
-    }
-    m_map = {
-        'gen':'1','feb':'2','mar':'3','apr':'4','mag':'5','giu':'6',
-        'lug':'7','ago':'8','set':'9','ott':'10','nov':'11','dic':'12'
-    }
+    mesi_q = {1:"Q1",2:"Q1",3:"Q1",4:"Q2",5:"Q2",6:"Q2",7:"Q3",8:"Q3",9:"Q3",10:"Q4",11:"Q4",12:"Q4"}
+    m_map = {'gen':'1','feb':'2','mar':'3','apr':'4','mag':'5','giu':'6','lug':'7','ago':'8','set':'9','ott':'10','nov':'11','dic':'12'}
     t = eta_text.lower()
-    for k,v in m_map.items():
+    for k, v in m_map.items():
         if k in t:
             try:
                 m = int(v)
                 q = mesi_q[m]
-                # formato richiesto: "Qx - Qy"
-                nxt = {"Q1":"Q2","Q2":"Q3","Q3":"Q4","Q4":"Q1"}.get(q,"Q4")
+                nxt = {"Q1":"Q2","Q2":"Q3","Q3":"Q4","Q4":"Q1"}[q]
                 return f"{q} - {nxt}"
             except Exception:
                 break
@@ -99,82 +144,66 @@ def build_description(deadline: str, eta: str, descr: str) -> str:
     if eta:
         parts.append(f"<p><strong>ETA:</strong> {html.escape(eta_to_quarters(eta))}</p>")
     if parts:
-        # riga vuota
-        parts.append("<p>&nbsp;</p>")
+        parts.append("<p>&nbsp;</p>")  # riga vuota
     if descr:
-        # preserva righe
         safe = html.escape(descr)
         safe = safe.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
         parts.append(f"<p>{safe}</p>")
     return "<div>" + "".join(parts) + "</div>"
 
-def read_csv(path: str):
-    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
-        sniffer = csv.Sniffer()
-        sample = fh.read(4096)
-        fh.seek(0)
-        dialect = csv.excel
-        delimiter = ";"
-        if sniffer.has_header(sample):
-            pass
-        rdr = csv.DictReader(fh, delimiter=delimiter)
-        required = ["nome_articolo","prezzo_eur","sku","brand","categoria","descrizione","preorder_deadline","eta"]
-        missing = [c for c in required if c not in (rdr.fieldnames or [])]
-        if missing:
-            raise RuntimeError(f"CSV mancano colonne: {missing}")
-        for i, row in enumerate(rdr, start=2):
-            yield i, row
-
-# ---------- Catalog helpers
+# -------- API catalogo
 
 def get_collections_map() -> Dict[str, str]:
-    # REST: POST /stores/v1/collections/query oppure GET con limit
-    # La doc consiglia query; alcune istanze rispondono al GET.
-    # Provo GET, fallback a query.
+    # Prova GET, poi POST /query
     try:
         res = req("GET", "/stores/v1/collections?limit=100", None, ok=(200,))
         items = res.get("collections", []) or res.get("items", []) or []
     except Exception:
-        # fallback query
         body = {"query": {"paging": {"limit": 100}}}
         res = req("POST", "/stores/v1/collections/query", body, ok=(200,))
         items = res.get("collections", []) or res.get("items", []) or []
     mp = {}
     for c in items:
         name = (c.get("name") or "").strip().lower()
-        if name and c.get("id"):
-            mp[name] = c["id"]
+        cid = c.get("id")
+        if name and cid:
+            mp[name] = cid
     return mp
 
 def find_product_by_sku(sku: str) -> Optional[str]:
-    # prova forma 1
+    if not sku:
+        return None
+    # Tentativo 1
     try:
         body = {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}}
         res = req("POST", "/stores/v1/products/query", body, ok=(200,))
         items = res.get("products", []) or res.get("items", [])
         if items:
-            return items[0]["id"]
+            return items[0].get("id")
     except Exception:
-        # forma 2 con $eq
-        try:
-            body = {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}}
-            res = req("POST", "/stores/v1/products/query", body, ok=(200,))
-            items = res.get("products", []) or res.get("items", [])
-            if items:
-                return items[0]["id"]
-        except Exception:
-            return None
+        pass
+    # Tentativo 2 ($eq)
+    try:
+        body = {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 1}}}
+        res = req("POST", "/stores/v1/products/query", body, ok=(200,))
+        items = res.get("products", []) or res.get("items", [])
+        if items:
+            return items[0].get("id")
+    except Exception:
+        pass
     return None
 
-def ensure_brand_in_payload(brand_name: str) -> Dict[str, Any]:
-    brand_name = (brand_name or "").strip()
-    return {"name": brand_name} if brand_name else {}
+# -------- Creazione/Aggiornamento prodotto
+
+def ensure_brand(brand_name: str) -> Dict[str, Any]:
+    b = (brand_name or "").strip()
+    return {"name": b} if b else {}
 
 def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: Dict[str,str]):
     name_raw = (row.get("nome_articolo") or "").strip()
     price = fmt_money(row.get("prezzo_eur") or 0)
-    if not name_raw or not price:
-        log(f"[SKIP] Riga {rownum}: nome_articolo o prezzo_eur mancante.")
+    if not name_raw or price <= 0:
+        log(f"[SKIP] Riga {rownum}: nome_articolo o prezzo_eur mancante/non valido.")
         return
 
     sku = (row.get("sku") or "").strip()
@@ -188,16 +217,17 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
     slug = mk_slug(name, sku)
     description_html = build_description(deadline, eta, descr)
 
+    # productType numerico per compatibilità (1 = physical)
     product_payload = {
         "product": {
             "name": name,
             "slug": slug,
-            "productType": "physical",  # ATTENZIONE: minuscolo (doc ufficiale)
+            "productType": 1,
             "priceData": {"price": price},
             "sku": sku,
             "description": description_html,
             "ribbon": "PREORDER",
-            "brand": ensure_brand_in_payload(brand),
+            "brand": ensure_brand(brand),
             "manageVariants": True,
             "productOptions": [
                 {
@@ -218,10 +248,9 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
         }
     }
 
-    existing_id = find_product_by_sku(sku) if sku else None
+    existing_id = find_product_by_sku(sku)
 
     if existing_id:
-        # Update
         log(f"[UPD] Riga {rownum}: aggiorno '{name}' (SKU={sku})")
         try:
             req("PATCH", f"/stores/v1/products/{existing_id}", product_payload, ok=(200,))
@@ -229,7 +258,6 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
             raise RuntimeError(f"PATCH /products/{existing_id} fallita: {e}")
         product_id = existing_id
     else:
-        # Create
         log(f"[NEW] {name} (SKU={sku})")
         try:
             res = req("POST", "/stores/v1/products", product_payload, ok=(200,))
@@ -239,7 +267,7 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
         if not product_id:
             raise RuntimeError("ID prodotto non ricevuto.")
 
-    # Aggiorna varianti prezzi
+    # Varianti: prezzi specifici per le due scelte
     try:
         variant_body = {
             "variants": [
@@ -257,13 +285,14 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
     except Exception as e:
         raise RuntimeError(f"PATCH /products/{product_id}/variants fallita: {e}")
 
-    # Aggiungi a categoria se presente
+    # Categoria (collezione)
     if categoria:
-        coll_key = categoria.strip().lower()
-        coll_id = collections_map.get(coll_key)
+        key = categoria.strip().lower()
+        coll_id = collections_map.get(key)
         if coll_id:
             try:
                 body = {"productIds": [product_id]}
+                # endpoint add by ids
                 req("POST", f"/stores/v1/collections/{coll_id}/productIds", body, ok=(200,204))
                 log(f"[INFO] Assegnato a collection '{categoria}'")
             except Exception as e:
@@ -273,12 +302,11 @@ def create_or_update_product(rownum: int, row: Dict[str, str], collections_map: 
 
     log(f"[OK] Riga {rownum} '{name}' creato/aggiornato (SKU={sku})")
 
-# ---------- main
+# -------- main
 
 def precheck():
     if not WIX_API_KEY or not WIX_SITE_ID:
         raise RuntimeError("WIX_API_KEY o WIX_SITE_ID mancanti (secrets).")
-    # semplice ping lettura prodotti
     try:
         req("POST", "/stores/v1/products/query", {"query": {"paging": {"limit": 1}}}, ok=(200,))
         log("[PRECHECK] API ok.")
@@ -291,37 +319,39 @@ def main():
     else:
         csv_path = "input/template_preordini_v7.csv"
 
-    log("[PRECHECK] API ok. Inizio…")
-    # carica categorie
+    log(f"[INFO] CSV: {csv_path}")
+    precheck()
+
+    # categorie
     try:
         collections = get_collections_map()
         if collections:
-            names = ", ".join(sorted(list(collections.keys()))[:20])
+            names = ", ".join(sorted(list(collections.keys())))
             log(f"[INFO] Categorie caricate: {names}")
         else:
             log("[WARN] Nessuna categoria recuperata.")
+            collections = {}
     except Exception as e:
         log(f"[WARN] Lettura categorie fallita: {e}")
         collections = {}
 
-    log(f"[INFO] CSV: {csv_path}")
-    total_ok = 0
-    total_err = 0
+    ok_cnt = 0
+    err_cnt = 0
 
     for rownum, row in read_csv(csv_path):
         try:
             create_or_update_product(rownum, row, collections)
-            total_ok += 1
+            ok_cnt += 1
         except Exception as e:
             name = (row.get("nome_articolo") or "").strip()
             log(f"[ERRORE] Riga {rownum} '{name}': {e}")
-            total_err += 1
+            err_cnt += 1
 
-    if total_ok > 0 and total_err == 0:
-        log(f"[FINE] Ok: {total_ok}")
+    if ok_cnt > 0 and err_cnt == 0:
+        log(f"[FINE] Ok: {ok_cnt}")
         sys.exit(0)
-    elif total_ok > 0:
-        log(f"[FINE] Ok: {total_ok}  Errori: {total_err}")
+    elif ok_cnt > 0:
+        log(f"[FINE] Ok: {ok_cnt}  Errori: {err_cnt}")
         sys.exit(0)
     else:
         log("[ERRORE] Nessun prodotto creato/aggiornato.")
