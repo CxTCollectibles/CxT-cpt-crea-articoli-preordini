@@ -12,6 +12,7 @@ on:
 jobs:
   importa:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,23 +29,44 @@ jobs:
 
       - name: Preflight Wix auth
         env:
-          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}   # oppure ${{ secrets.WIX_API_KEY }}
+          # Se i tuoi secret si chiamano diversamente (es. WIX_API_KEY), rimappa qui:
+          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
         run: |
           set -e
-          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+          echo "== Preflight 1: GET /stores/v1/collections?limit=1 =="
+          RESP=$(mktemp)
+          CODE=$(curl -sS -o "$RESP" -w "%{http_code}" \
             -H "Authorization: $WIX_AUTH_HEADER" \
             -H "wix-site-id: $WIX_SITE_ID" \
             -H "Content-Type: application/json" \
             "https://www.wixapis.com/stores/v1/collections?limit=1")
-          echo "HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "Preflight fallito. Controlla WIX_AUTH_HEADER e WIX_SITE_ID"; exit 2; fi
+          echo "HTTP $CODE"
+          tail -c 600 "$RESP" || true
+
+          if [ "$CODE" = "404" ]; then
+            echo "::warning::404 Not Found. Di solito: header wix-site-id contiene lo 'siteId' (sbagliato) invece del 'metaSiteId', oppure Stores non è installato/abilitato per la chiave."
+            echo "== Preflight 2: GET /stores/v1/products?limit=1 =="
+            CODE2=$(curl -sS -o "$RESP" -w "%{http_code}" \
+              -H "Authorization: $WIX_AUTH_HEADER" \
+              -H "wix-site-id: $WIX_SITE_ID" \
+              -H "Content-Type: application/json" \
+              "https://www.wixapis.com/stores/v1/products?limit=1")
+            echo "HTTP $CODE2"
+            tail -c 600 "$RESP" || true
+            if [ "$CODE2" != "200" ]; then
+              echo "Preflight fallito. Controlla che WIX_SITE_ID sia il metaSiteId e che la API Key abbia permessi Stores."; exit 2;
+            fi
+          elif [ "$CODE" != "200" ]; then
+            echo "Preflight fallito. HTTP=$CODE"; exit 2;
+          fi
+          echo "Preflight OK."
 
       - name: Esegui import
         env:
           WIX_API_BASE: https://www.wixapis.com
-          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}   # oppure ${{ secrets.WIX_API_KEY }}
+          # Rimappa qui se usi un nome secret diverso:
+          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
           CSV_PATH: input/template_preordini_v7.csv
         run: |
