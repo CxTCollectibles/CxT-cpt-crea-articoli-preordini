@@ -6,7 +6,6 @@ import html
 import json
 import os
 import sys
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -122,7 +121,8 @@ def find_collection_id(name: str) -> Optional[str]:
     if r.status_code != 200:
         print(f"[WARN] Lettura categorie fallita: {r.status_code} {r.text[:200]}")
         return None
-    items = (r.json() or {}).get("collections") or (r.json() or {}).get("items") or []
+    data = r.json() or {}
+    items = data.get("collections") or data.get("items") or []
     name_l = name.strip().lower()
     for it in items:
         if (it.get("name") or "").strip().lower() == name_l:
@@ -178,7 +178,7 @@ def set_variants_with_fallback(pid: str, dep: float, pre: float) -> None:
     if r.status_code == 200:
         return
 
-    # B) choices come title/description (alcuni tenant li vogliono così…)
+    # B) choices come title/description
     pB = {
         "variants": [
             {
@@ -239,12 +239,12 @@ def upsert(row: Dict[str, str]) -> Tuple[str, bool]:
 
     base = {
         "name": name,
-        "productType": "physical",
+        "productType": 1,  # physical
         "sku": sku,
         "description": descr_html,
         "ribbon": "PREORDER",
         "priceData": {"price": price},
-        "brand": brand if brand else None,  # stringa
+        "brand": brand if brand else None,  # stringa brand
         "manageVariants": True,
         "productOptions": [
             {
@@ -275,7 +275,6 @@ def upsert(row: Dict[str, str]) -> Tuple[str, bool]:
         if r.status_code != 200:
             raise RuntimeError(f"PATCH /products/{pid} fallita: {r.status_code} {r.text}")
 
-    # garantiamo options e poi varianti con fallback
     ensure_options(pid)
     dep, pre = calc_prices(price)
     set_variants_with_fallback(pid, dep, pre)
