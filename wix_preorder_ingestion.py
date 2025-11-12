@@ -22,7 +22,7 @@ HEADERS = {
 # Mappa nome categoria (minuscolo) -> id (riempita a runtime)
 CATEGORIES: Dict[str, str] = {}
 
-# Nomi esatti delle due opzioni e della dimensione opzione
+# Opzioni preordine
 OPT_TITLE = "PREORDER PAYMENTS OPTIONS*"
 CHOICE_AS = "ANTICIPO/SALDO"
 CHOICE_PA = "PAGAMENTO ANTICIPATO"
@@ -95,11 +95,10 @@ def add_to_category(prod_id: str, category_name: str):
 
 def query_product_by_sku(sku: str) -> Optional[Tuple[str, str]]:
     """
-    Ritorna (productId, revision) se trovato via API v3 (usiamo reader per id e poi get v3 per revision)
+    Ritorna (productId, revision) se trovato via API v3.
+    Cerca con stores-reader/v1/products/query e poi GET v3 per la revision.
     """
     try:
-        # 1) cerca per SKU con endpoint reader (filtri $eq). Docs: stores-reader/v1/products/query
-        # https://dev.wix.com/docs/rest/business-solutions/stores/products/filter-sort#sku
         payload = {"query": {"filter": {"sku": {"$eq": sku}}, "paging": {"limit": 50}}}
         r = req("POST", "/stores-reader/v1/products/query", json_body=payload)
         items = r.json().get("products", [])
@@ -108,7 +107,6 @@ def query_product_by_sku(sku: str) -> Optional[Tuple[str, str]]:
         pid = items[0].get("id")
         if not pid:
             return None
-        # 2) leggi prodotto v3 per prendere revision (serve per update v3)
         r2 = req("GET", f"/stores/v3/products/{pid}")
         prod = r2.json().get("product", {})
         return pid, prod.get("revision", "1")
@@ -139,7 +137,6 @@ def create_or_update(row: Dict[str, str]):
 
     desc_html = build_description(deadline, eta, descr)
 
-    # Oggetto prodotto per API v3
     product_obj = {
         "name": name,
         "sku": sku,
@@ -194,7 +191,6 @@ def create_or_update(row: Dict[str, str]):
             if not prod_id:
                 die(f"{name}: ID prodotto non ricevuto.")
     except Exception as e:
-        # Se il create/update v3 dovesse fallire per SKU duplicato o amenità strane, prova a leggere ancora e prosegui con categoria
         print(f"[WARN] v3 create/update fallita: {e}")
         existing = query_product_by_sku(sku)
         if not existing:
@@ -207,22 +203,27 @@ def create_or_update(row: Dict[str, str]):
 
     return prod_id
 
+def safe_precheck():
+    """
+    Precheck non bloccante: prova una query reader con limit 1.
+    Se fallisce, logga e va avanti.
+    """
+    try:
+        payload = {"query": {"filter": {}, "paging": {"limit": 1}}}
+        r = req("POST", "/stores-reader/v1/products/query", json_body=payload)
+        vis = len(r.json().get("products", []))
+        print(f"[PRECHECK] API ok. Prodotti leggibili: {vis}")
+    except Exception as e:
+        print(f"[WARN] Precheck prodotti fallito (non blocco): {e}")
+
 def main():
     if not API_KEY or not SITE_ID:
         die("WIX_API_KEY o WIX_SITE_ID mancanti nei secrets.")
 
     csv_path = sys.argv[1] if len(sys.argv) > 1 else "input/template_preordini_v7.csv"
 
-    # Precheck
-    try:
-        # ping semplice: leggere qualche prodotto visibile
-        r = req("GET", "/stores-reader/v1/products", params={"limit": 1})
-        vis = len(r.json().get("products", []))
-        print(f"[PRECHECK] API ok. Prodotti visibili: {vis}")
-    except Exception as e:
-        die(f"API non raggiungibili: {e}")
-
-    load_categories()
+    safe_precheck()          # non blocca più
+    load_categories()        # prova a caricare categorie
 
     print(f"[INFO] CSV: {csv_path}")
     created = 0
