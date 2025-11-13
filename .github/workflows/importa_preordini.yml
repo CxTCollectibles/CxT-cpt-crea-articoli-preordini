@@ -1,4 +1,4 @@
-name: Importa Preordini (V7)
+name: Importa Preordini
 
 on:
   workflow_dispatch:
@@ -9,13 +9,13 @@ on:
         default: "input/template_preordini_v7.csv"
 
 jobs:
-  importa:
+  run:
     runs-on: ubuntu-latest
 
     env:
       WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
       WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-      CSV_PATH: ${{ inputs.csv_path }}
+      CSV_PATH: ${{ github.event.inputs.csv_path }}
 
     steps:
       - name: Checkout
@@ -29,24 +29,10 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil
-
-      - name: Preflight Wix (Catalog Version)
-        shell: python
-        run: |
-          import os, sys, requests
-          base = "https://www.wixapis.com"
-          headers = {"Authorization": os.environ["WIX_API_KEY"], "wix-site-id": os.environ["WIX_SITE_ID"]}
-          r = requests.get(f"{base}/stores/v3/provision/version", headers=headers)
-          print("Status:", r.status_code)
-          if r.status_code == 200:
-              print("Body:", r.text)
-          else:
-              print("Headers:", dict(r.headers))
-          if r.status_code == 404:
-              print("Preflight 404: molto probabilmente il catalogo è V3 e gli endpoint V1 non sono disponibili, oppure chiave senza permessi Stores.")
-              sys.exit(2)
+          pip install requests python-dateutil Unidecode
 
       - name: Run ingestion
         run: |
+          test -n "$WIX_API_KEY" || (echo "WIX_API_KEY mancante" && exit 1)
+          test -n "$WIX_SITE_ID" || (echo "WIX_SITE_ID mancante" && exit 1)
           python3 wix_preorder_ingestion.py "$CSV_PATH"
