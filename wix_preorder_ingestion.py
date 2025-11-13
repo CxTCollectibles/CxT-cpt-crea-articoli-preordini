@@ -83,8 +83,11 @@ def html_description(pre_deadline: str, eta: str, descr: str) -> str:
     if eta:
         parts.append(f"<p>ETA: {eta}</p>")
     parts.append("<p>&nbsp;</p>")  # riga vuota
+
     if descr:
-        parts.append(f"<p>{descr.replace('\n','<br>')}</p>")
+        descr_html = descr.replace("\n", "<br>")
+        parts.append("<p>" + descr_html + "</p>")
+
     return "<div>" + "".join(parts) + "</div>"
 
 # ==========================
@@ -213,7 +216,7 @@ def build_product_payload(nome: str, sku: str, brand: str, price: float, descr_h
         "name": name80,
         "slug": slugify(name80),
         "sku": sku,
-        "productType": "physical",   # fondamentale: senza wrapper 'product' non veniva letto
+        "productType": "physical",
         "visible": True,
         "priceData": {"price": price, "currency": "EUR"},
         "description": descr_html,
