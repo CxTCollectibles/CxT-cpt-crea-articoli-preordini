@@ -4,19 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: "Percorso CSV"
-        required: false
+        description: "Percorso CSV (da XLS V7)"
+        required: true
         default: "input/template_preordini_v7.csv"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-      CSV_PATH: ${{ github.event.inputs.csv_path }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,6 +25,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Importa
+      - name: Esegui import
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+          DEPOSIT_PCT: "0.30"
+          CSV_PATH: ${{ github.event.inputs.csv_path }}
         run: |
           python wix_preorder_ingestion.py "$CSV_PATH"
