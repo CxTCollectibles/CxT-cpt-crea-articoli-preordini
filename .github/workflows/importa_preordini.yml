@@ -1,24 +1,18 @@
-name: Importa Preordini
+name: Importa Preordini su WIX
 
 on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: "Percorso CSV (default: input/template_preordini_v7.csv)"
+        description: "Percorso CSV (es. input/template_preordini_v7.csv)"
         required: false
         default: "input/template_preordini_v7.csv"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    env:
-      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-      CSV_PATH: ${{ github.event.inputs.csv_path }}
-
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -29,10 +23,12 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil Unidecode
+          pip install requests
 
-      - name: Run ingestion
+      - name: Esegui import
+        env:
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+          CSV_PATH: ${{ inputs.csv_path }}
         run: |
-          test -n "$WIX_API_KEY" || (echo "WIX_API_KEY mancante" && exit 1)
-          test -n "$WIX_SITE_ID" || (echo "WIX_SITE_ID mancante" && exit 1)
-          python3 wix_preorder_ingestion.py "$CSV_PATH"
+          python wix_preorder_ingestion.py "$CSV_PATH"
