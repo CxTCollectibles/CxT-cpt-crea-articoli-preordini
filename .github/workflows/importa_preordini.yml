@@ -29,7 +29,7 @@ jobs:
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          DEPOSIT_PCT: "0.30"
+          DEPOSIT_PCT: "0.30"     # cambia qui se vuoi un anticipo diverso
           CSV_PATH: ${{ github.event.inputs.csv_path }}
         run: |
           python wix_preorder_ingestion.py "$CSV_PATH"
