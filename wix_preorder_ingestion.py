@@ -84,18 +84,15 @@ def query_page(limit=100, cursor=None):
     return req("POST", "/stores/v1/products/query", body)
 
 def find_by_sku_scan(sku: str) -> dict | None:
-    """Scansione paginata senza filtri (evita l'errore del parser filtro)."""
+    """Scansione paginata senza filtri (evita errori parser su filter)."""
     cursor = None
-    seen = 0
     for _ in range(50):  # guardrail
         res = query_page(limit=100, cursor=cursor)
         items = (res or {}).get("items") or []
         for it in items:
             if str(it.get("sku", "")).strip() == sku:
                 return it
-        # paging può stare a top-level o sotto 'paging'
         cursor = (res.get("paging") or {}).get("nextCursor") or res.get("nextCursor")
-        seen += len(items)
         if not cursor or not items:
             break
     return None
@@ -164,18 +161,16 @@ def get_product(product_id: str) -> dict:
     return res.get("product", {}) if isinstance(res, dict) else {}
 
 def ensure_option(product_id: str) -> str:
-    """Garantisce l'esistenza dell'opzione e ritorna il nome esatto da usare come 'title' nel PATCH variants."""
+    """Garantisce l'opzione e ritorna il nome esatto da usare come 'key' del dict choices."""
     descr_deposit = f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"
     descr_early   = f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"
 
-    # retry per consistenza Wix
     for attempt in range(8):
         prod = get_product(product_id)
         opts = prod.get("productOptions") or []
         for opt in opts:
             values = [ (c or {}).get("value","").strip().upper() for c in (opt.get("choices") or []) ]
             if CHOICE_DEPOSIT.upper() in values and CHOICE_EARLY.upper() in values:
-                # riempi descrizioni se vuote
                 changed = False
                 for ch in (opt.get("choices") or []):
                     if ch.get("value","").strip().upper() == CHOICE_DEPOSIT.upper() and not (ch.get("description") or "").strip():
@@ -191,7 +186,7 @@ def ensure_option(product_id: str) -> str:
                     time.sleep(0.5)
                 return opt.get("name") or opt.get("title") or OPTION_TITLE
 
-        # se non c'è ancora, la creo
+        # se non c'è, la creo ora
         req("PATCH", f"/stores/v1/products/{product_id}", {
             "product": {
                 "manageVariants": True,
@@ -206,24 +201,24 @@ def ensure_option(product_id: str) -> str:
                 ],
             }
         })
-        time.sleep(0.8)  # dagli tempo a generare le varianti
+        time.sleep(0.8)  # tempo perché Wix generi le varianti
 
-    # ultimo fallback: restituisco comunque il nome standard
     return OPTION_TITLE
 
 def set_variant_prices(product_id: str, option_name: str, base_price: Decimal):
     price_deposit = (base_price * DEPOSIT_PCT).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     price_early   = (base_price * (Decimal("1") - EARLY_PAY_DISC)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+    # *** QUI il formato richiesto da Wix v1: choices = oggetto { "NomeOpzione": "ValoreScelta" }
     body = {
         "variants": [
             {
-                "choices": [{"title": option_name, "description": CHOICE_DEPOSIT}],
-                "priceData": {"price": money(price_deposit)}
+                "choices": { option_name: CHOICE_DEPOSIT },
+                "priceData": { "price": money(price_deposit) }
             },
             {
-                "choices": [{"title": option_name, "description": CHOICE_EARLY}],
-                "priceData": {"price": money(price_early)}
+                "choices": { option_name: CHOICE_EARLY },
+                "priceData": { "price": money(price_early) }
             },
         ]
     }
@@ -254,12 +249,10 @@ def main():
 
             prod = find_by_sku_scan(sku)
             if not prod:
-                # crea
                 try:
                     pid = create_product(name, price, sku, brand, descr)
                     print(f"[NEW] Creato {sku} -> {pid}")
                 except Exception as e:
-                    # se Wix urla "sku is not unique", rifaccio la scansione e prendo l'ID
                     if "sku is not unique" in str(e).lower():
                         prod = find_by_sku_scan(sku)
                         if not prod:
