@@ -6,6 +6,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,9 +21,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Preflight API (usa solo WIX_API_KEY + WIX_SITE_ID)
+        env:
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+        run: |
+          test -n "$WIX_SITE_ID" || (echo "WIX_SITE_ID mancante" && exit 1)
+          test -n "$WIX_API_KEY" || (echo "WIX_API_KEY mancante" && exit 1)
+          set -e
+          echo "== GET /stores/v1/collections?limit=1 =="
+          curl -sS -D /tmp/h -o /tmp/b \
+            -H "Authorization: $WIX_API_KEY" \
+            -H "wix-site-id: $WIX_SITE_ID" \
+            "https://www.wixapis.com/stores/v1/collections?limit=1" || true
+          code=$(grep -i "^HTTP/" /tmp/h | tail -1 | awk '{print $2}')
+          echo "HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "Preflight fallito. Controlla che WIX_SITE_ID sia il metaSiteId e WIX_API_KEY abbia permessi Stores."
+            echo "--- HEADERS ---"; cat /tmp/h
+            echo "--- BODY ---"; cat /tmp/b
+            exit 2
+          fi
+
       - name: Importa/aggiorna prodotti da CSV
         env:
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
+          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
         run: |
           python3 wix_preorder_ingestion.py "input/template_preordini_v7.csv"
