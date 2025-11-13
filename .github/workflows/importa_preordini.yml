@@ -24,54 +24,58 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Preflight API (auto-try raw/Bearer + metaSiteId/siteId)
+      - name: Preflight API (Python, no shell tools)
         env:
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}         # metaSiteId
-          WIX_SITE_ID_ALT: ${{ secrets.WIX_SITE_ID_ALT }} # siteId (opzionale)
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}         # metaSiteId (obbligatorio)
+          WIX_SITE_ID_ALT: ${{ secrets.WIX_SITE_ID_ALT }} # siteId “corto” (opzionale)
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
         run: |
-          set -e
-          test -n "$WIX_API_KEY" || (echo "WIX_API_KEY mancante" && exit 1)
-          test -n "$WIX_SITE_ID" || (echo "WIX_SITE_ID mancante" && exit 1)
+          python - <<'PY'
+          import os, sys, requests
 
-          try_call () {
-            local AUTH_HDR="$1"
-            local SITE="$2"
-            local PATH="$3"
-            echo ">>> Test: $AUTH_HDR | wix-site-id=$SITE | GET $PATH"
-            curl -sS -D /tmp/h -o /tmp/b \
-              -H "Authorization: $AUTH_HDR" \
-              -H "wix-site-id: $SITE" \
-              "https://www.wixapis.com$PATH" || true
-            code=$(grep -i "^HTTP/" /tmp/h | tail -1 | awk '{print $2}')
-            echo "HTTP $code"
-            if [ "$code" = "200" ]; then
-              echo "OK"
-              return 0
-            else
-              echo "--- HEADERS ---"; cat /tmp/h
-              echo "--- BODY ---"; cat /tmp/b
-              return 1
-            fi
-          }
+          base = "https://www.wixapis.com"
+          api_key = os.environ.get("WIX_API_KEY", "").strip()
+          msid    = os.environ.get("WIX_SITE_ID", "").strip()
+          sid_alt = os.environ.get("WIX_SITE_ID_ALT", "").strip()
 
-          ok=0
-          # combinazioni da provare (raw e Bearer) × (metaSiteId e (se c'è) siteId)
-          for AUTH in "$WIX_API_KEY" "Bearer $WIX_API_KEY"; do
-            for SID in "$WIX_SITE_ID" ${WIX_SITE_ID_ALT:+$WIX_SITE_ID_ALT}; do
-              try_call "$AUTH" "$SID" "/stores/v1/collections?limit=1" && ok=1 && break
-              try_call "$AUTH" "$SID" "/stores/v1/products?limit=1"   && ok=1 && break
-            done
-            [ $ok -eq 1 ] && break
-          done
+          if not api_key:
+            print("WIX_API_KEY mancante"); sys.exit(1)
+          if not msid:
+            print("WIX_SITE_ID mancante (serve il metaSiteId)"); sys.exit(1)
 
-          if [ $ok -ne 1 ]; then
-            echo "Preflight fallito. Cause tipiche:"
-            echo "1) API key senza permessi Wix Stores"
-            echo "2) Header wix-site-id non allineato (metaSiteId vs siteId)"
-            echo "3) Formato Authorization non accettato (raw/Bearer)"
-            exit 2
-          fi
+          sites = [msid] + ([sid_alt] if sid_alt else [])
+          auths = [api_key, f"Bearer {api_key}"]
+          paths = ["/stores/v1/collections?limit=1", "/stores/v1/products?limit=1"]
+
+          ok = False
+          for auth in auths:
+            for site in sites:
+              for path in paths:
+                try:
+                  print(f">>> Test Authorization='{auth.split()[0]}' wix-site-id={site} GET {path}")
+                  r = requests.get(base + path, headers={
+                    "Authorization": auth,
+                    "wix-site-id": site
+                  }, timeout=20)
+                  print("HTTP", r.status_code)
+                  if r.status_code == 200:
+                    ok = True
+                    break
+                  else:
+                    print("Headers:", dict(r.headers))
+                    print("Body:", r.text[:400])
+                except Exception as e:
+                  print("EXC:", e)
+              if ok: break
+            if ok: break
+
+          if not ok:
+            print("Preflight fallito. Possibili cause:")
+            print("1) Permessi Stores mancanti alla API key")
+            print("2) wix-site-id non allineato (metaSiteId vs siteId)")
+            print("3) Formato Authorization non accettato (raw/Bearer)")
+            sys.exit(2)
+          PY
 
       - name: Importa/aggiorna prodotti da CSV
         env:
