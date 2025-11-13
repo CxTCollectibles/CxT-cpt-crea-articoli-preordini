@@ -11,8 +11,8 @@ import requests
 CSV_DEFAULT = "input/template_preordini_v7.csv"
 
 WIX_API_BASE = "https://www.wixapis.com"
-WIX_API_KEY = os.environ.get("WIX_API_KEY")  # secret
-WIX_SITE_ID = os.environ.get("WIX_SITE_ID")  # metaSiteId (secret)
+WIX_API_KEY = os.environ.get("WIX_API_KEY")
+WIX_SITE_ID = os.environ.get("WIX_SITE_ID")
 
 # Varianti/prezzi
 DEPOSIT_PCT = Decimal("0.30")        # 30% ANTICIPO/SALDO
@@ -21,10 +21,10 @@ OPTION_TITLE = "PREORDER PAYMENTS OPTIONS*"
 CHOICE_DEPOSIT = "ANTICIPO/SALDO"
 CHOICE_EARLY = "PAGAMENTO ANTICIPATO"
 
-# ================== UTILS BASE ==================
+# ================== HTTP ==================
 def headers():
     if not WIX_API_KEY or not WIX_SITE_ID:
-        raise RuntimeError("WIX_API_KEY e/o WIX_SITE_ID mancanti nelle env.")
+        raise RuntimeError("WIX_API_KEY e/o WIX_SITE_ID mancanti.")
     return {
         "Authorization": WIX_API_KEY,
         "wix-site-id": WIX_SITE_ID,
@@ -44,6 +44,7 @@ def req(method: str, path: str, payload: dict | None = None):
     except Exception:
         return {}
 
+# ================== UTIL ==================
 def money(val) -> float:
     d = Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return float(d)
@@ -76,16 +77,16 @@ def read_csv(path: str):
         for i, row in enumerate(rd, start=2):
             yield i, row
 
-# ================== QUERY/CREATE/PATCH PRODOTTO ==================
+# ================== PRODOTTI ==================
 def query_product_by_sku(sku: str) -> dict | None:
-    body = {"query": {"filter": {"sku": str(sku)}}}
+    # Wix vuole il filtro come stringa (non oggetto)
+    body = {"query": {"filter": f'sku eq "{sku}"', "paging": {"limit": 1}}}
     try:
         res = req("POST", "/stores-reader/v1/products/query", body)
         items = (res or {}).get("items") or []
         return items[0] if items else None
     except Exception as e:
         print(f"[WARN] Query SKU fallita {sku}: {e}")
-        # Fallback writer
         try:
             res = req("POST", "/stores/v1/products/query", body)
             items = (res or {}).get("items") or []
@@ -107,6 +108,9 @@ def build_description(preorder_scadenza: str, eta: str, descr: str) -> str:
     return "\n".join(parts)
 
 def create_product(name: str, price: Decimal, sku: str, brand: str, description: str) -> str:
+    descr_deposit = f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"
+    descr_early   = f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"
+
     body = {
         "product": {
             "productType": "physical",
@@ -115,18 +119,17 @@ def create_product(name: str, price: Decimal, sku: str, brand: str, description:
             "brand": brand or "",
             "description": description or "",
             "priceData": {"price": money(price)},
-            # Creo già l'opzione con descrizioni NON vuote per evitare 400
+            "visible": True,
             "manageVariants": True,
             "productOptions": [
                 {
                     "name": OPTION_TITLE,
                     "choices": [
-                        {"value": CHOICE_DEPOSIT, "description": f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"},
-                        {"value": CHOICE_EARLY,   "description": f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"},
+                        {"value": CHOICE_DEPOSIT, "description": descr_deposit},
+                        {"value": CHOICE_EARLY,   "description": descr_early},
                     ],
                 }
             ],
-            "visible": True,
         }
     }
     res = req("POST", "/stores/v1/products", body)
@@ -145,9 +148,9 @@ def patch_product(product_id: str, name: str, price: Decimal, brand: str, descri
     }
     req("PATCH", f"/stores/v1/products/{product_id}", body)
 
-# ================== VARIANTI: OPZIONE + PREZZI ==================
+# ================== VARIANTI ==================
 def ensure_option(product_id: str) -> str:
-    # Garantisce che l'opzione esista con descrizioni piene
+    # Garantisce che esista OPTION_TITLE con scelte e descrizioni non vuote
     prod = req("GET", f"/stores/v1/products/{product_id}")
     product = prod.get("product", {}) if isinstance(prod, dict) else {}
     opts = product.get("productOptions") or []
@@ -157,25 +160,22 @@ def ensure_option(product_id: str) -> str:
 
     for opt in opts:
         choices = opt.get("choices") or []
-        values = [ (c or {}).get("value","").strip().upper() for c in choices ]
-        if CHOICE_DEPOSIT in values and CHOICE_EARLY in values:
+        values_upper = [ (c or {}).get("value","").strip().upper() for c in choices ]
+        if CHOICE_DEPOSIT in values_upper and CHOICE_EARLY in values_upper:
             changed = False
             for ch in choices:
                 if ch.get("value") == CHOICE_DEPOSIT and not (ch.get("description") or "").strip():
-                    ch["description"] = descr_deposit
-                    changed = True
+                    ch["description"] = descr_deposit; changed = True
                 if ch.get("value") == CHOICE_EARLY and not (ch.get("description") or "").strip():
-                    ch["description"] = descr_early
-                    changed = True
+                    ch["description"] = descr_early; changed = True
             if not product.get("manageVariants"):
-                product["manageVariants"] = True
-                changed = True
+                product["manageVariants"] = True; changed = True
             if changed:
                 req("PATCH", f"/stores/v1/products/{product_id}", {"product": {"productOptions": opts, "manageVariants": True}})
                 time.sleep(0.4)
+            # Il PATCH variants richiede "title" = nome dell'opzione
             return opt.get("name") or opt.get("title") or OPTION_TITLE
 
-    # Non trovata: la creo
     patch_body = {
         "product": {
             "manageVariants": True,
@@ -184,30 +184,39 @@ def ensure_option(product_id: str) -> str:
                     "name": OPTION_TITLE,
                     "choices": [
                         {"value": CHOICE_DEPOSIT, "description": descr_deposit},
-                        {"value": CHOICE_EARLY, "description": descr_early},
+                        {"value": CHOICE_EARLY,   "description": descr_early},
                     ],
                 }
             ],
         }
     }
     req("PATCH", f"/stores/v1/products/{product_id}", patch_body)
-    time.sleep(0.6)  # Wix è… lunatico
+    time.sleep(0.6)
     return OPTION_TITLE
 
 def set_variant_prices(product_id: str, option_name: str, base_price: Decimal):
     price_deposit = (base_price * DEPOSIT_PCT).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     price_early   = (base_price * (Decimal("1") - EARLY_PAY_DISC)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+    # ATTENZIONE: Wix si aspetta choices come LISTA di oggetti {title, description}
     body = {
         "variants": [
-            {"choices": {option_name: CHOICE_DEPOSIT}, "priceData": {"price": money(price_deposit)}},
-            {"choices": {option_name: CHOICE_EARLY},   "priceData": {"price": money(price_early)}},
+            {
+                "choices": [{"title": option_name, "description": CHOICE_DEPOSIT}],
+                "priceData": {"price": money(price_deposit)}
+            },
+            {
+                "choices": [{"title": option_name, "description": CHOICE_EARLY}],
+                "priceData": {"price": money(price_early)}
+            },
         ]
     }
     req("PATCH", f"/stores/v1/products/{product_id}/variants", body)
 
 def apply_preorder_variants(product_id: str, base_price: Decimal):
     opt_name = ensure_option(product_id)
+    # piccolo ritardo per coerenza interna di Wix
+    time.sleep(0.4)
     set_variant_prices(product_id, opt_name, base_price)
 
 # ================== MAIN ==================
@@ -220,8 +229,8 @@ def main():
     errors = 0
 
     for rownum, row in read_csv(csv_path):
+        name = safe_name(row.get("nome_articolo", ""))
         try:
-            name = safe_name(row.get("nome_articolo", ""))
             sku = str(row.get("sku", "")).strip()
             brand = (row.get("brand") or "").strip()
             prezzo = norm_price(row.get("prezzo_eur", "0"))
@@ -233,17 +242,13 @@ def main():
 
             print(f"[WORK] {name} (SKU={sku})")
 
-            # 1) cerca per SKU
             existing = query_product_by_sku(sku)
-
             if not existing:
-                # 2a) crea
                 try:
                     product_id = create_product(name, prezzo, sku, brand, descrizione)
                     print(f"[NEW] Creato {sku} -> {product_id}")
                     created += 1
                 except Exception as ce:
-                    # SKU duplicato? Prova a ri-query
                     if "sku is not unique" in str(ce).lower():
                         existing = query_product_by_sku(sku)
                         if not existing:
@@ -254,12 +259,10 @@ def main():
                         raise
             else:
                 product_id = existing.get("id")
-                # 2b) patch basi
                 patch_product(product_id, name, prezzo, brand, descrizione)
                 print(f"[UPD] Aggiornato {sku} -> {product_id}")
                 updated += 1
 
-            # 3) Varianti e prezzi
             apply_preorder_variants(product_id, prezzo)
 
         except Exception as e:
