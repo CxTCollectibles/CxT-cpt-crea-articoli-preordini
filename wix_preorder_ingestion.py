@@ -2,277 +2,326 @@
 # -*- coding: utf-8 -*-
 
 import csv
-import html
 import json
 import os
+import re
 import sys
-from typing import Any, Dict, List, Optional
+import time
+from decimal import Decimal, ROUND_HALF_UP
 
 import requests
 
-API = "https://www.wixapis.com"
+BASE = "https://www.wixapis.com"
 
-# Endpoints Stores v1
-EP_PRODUCTS_CREATE   = f"{API}/stores/v1/products"
-EP_PRODUCT_PATCH     = f"{API}/stores/v1/products/{{pid}}"
-EP_PRODUCTS_QUERY    = f"{API}/stores/v1/products/query"
-EP_COLLECTIONS_QUERY = f"{API}/stores/v1/collections/query"
-EP_COLLECTION_ADD    = f"{API}/stores/v1/collections/{{cid}}/products/add"
+OPTION_NAME = "PREORDER PAYMENTS OPTIONS*"
+CHOICE_DEPOSIT = "ANTICIPO/SALDO"
+CHOICE_PREPAID = "PAGAMENTO ANTICIPATO"
 
-# Colonne richieste dal CSV V7
-REQUIRED_COLS = [
-    "nome_articolo",
-    "prezzo_eur",
-    "sku",
-    "brand",
-    "categoria",
-    "descrizione",
-    "preorder_scadenza",
-    "eta",
-]
+CSV_DEFAULT_PATH = "input/template_preordini_v7.csv"
 
-def need_env(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        print(f"[FATAL] Variabile {name} mancante.")
-        sys.exit(2)
-    return v
+# -------- util --------
 
-def headers() -> Dict[str, str]:
+def money_to_decimal(val):
+    if val is None:
+        return None
+    s = str(val).strip().replace("€", "").replace(" ", "")
+    s = s.replace(",", ".")
+    try:
+        d = Decimal(s)
+    except:
+        return None
+    q = d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return q
+
+def pct(amount, percent):
+    return (amount * Decimal(percent)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def trunc(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[:n]
+
+def norm(s):
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def headers():
+    auth = os.getenv("WIX_AUTH_HEADER") or os.getenv("WIX_API_KEY")
+    site = os.getenv("WIX_SITE_ID")
+    if not auth or not site:
+        raise RuntimeError("Variabili WIX_AUTH_HEADER (o WIX_API_KEY) e/o WIX_SITE_ID mancanti.")
     return {
-        "Authorization": need_env("WIX_API_KEY"),
-        "wix-site-id": need_env("WIX_SITE_ID"),
-        "Content-Type": "application/json",
+        "Authorization": auth,
+        "wix-site-id": site,
+        "Content-Type": "application/json"
     }
 
-def to_price(s: str) -> float:
-    s = (s or "").replace("€", "").replace(",", ".").strip()
-    try:
-        return round(float(s), 2)
-    except Exception:
-        return 0.0
+S = requests.Session()
 
-def short_name(name: str) -> str:
-    name = (name or "").strip()
-    if len(name) > 80:
-        print("[WARN] Nome > 80 caratteri, troncato.")
-        name = name[:80]
-    return name
+def req(method, path, **kwargs):
+    url = BASE + path
+    h = headers()
+    r = S.request(method, url, headers=h, timeout=30, **kwargs)
+    return r
 
-def build_description(deadline: str, eta: str, body: str) -> str:
-    # Riga vuota tra ETA e corpo
-    raw = f"PREORDER DEADLINE: {deadline}\nETA: {eta}\n\n{body or ''}".strip()
-    esc = html.escape(raw).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
-    return f"<div><p>{esc}</p></div>"
+# -------- stores helpers --------
 
-def read_csv(path: str) -> List[Dict[str, str]]:
-    if not os.path.isfile(path):
-        print(f"[FATAL] CSV non trovato: {path}")
-        sys.exit(2)
-    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
-        sample = fh.read(4096)
-        fh.seek(0)
-        # prova sniff ; oppure ,
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-        except Exception:
-            class D(csv.Dialect):
-                delimiter = ';'
-                quotechar = '"'
-                doublequote = True
-                skipinitialspace = False
-                lineterminator = '\n'
-                quoting = csv.QUOTE_MINIMAL
-            dialect = D
-        rdr = csv.DictReader(fh, dialect=dialect)
-        cols = [c.strip() for c in (rdr.fieldnames or [])]
-        missing = [c for c in REQUIRED_COLS if c not in cols]
-        if missing:
-            raise RuntimeError(f"CSV mancano colonne: {missing}")
-        rows: List[Dict[str, str]] = []
-        for row in rdr:
-            rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
-        return rows
+def get_collections():
+    # Potrebbero essere 404 se Stores non è abilitato per la chiave: in quel caso log e proseguiamo senza bloccare.
+    r = req("GET", "/stores/v1/collections?limit=100")
+    if r.status_code != 200:
+        print(f"[WARN] Lettura categorie fallita: {r.status_code} {r.text}")
+        return {}
+    data = r.json()
+    out = {}
+    for c in data.get("collections", []):
+        # alcuni payload usano "id", altri "_id"
+        cid = c.get("id") or c.get("_id")
+        cname = c.get("name") or ""
+        out[norm(cname)] = cid
+    if out:
+        print("[INFO] Categorie caricate: " + ", ".join(sorted(out.keys())))
+    return out
 
-def post(url: str, payload: Dict[str, Any]) -> requests.Response:
-    return requests.post(url, headers=headers(), json=payload, timeout=30)
-
-def patch(url: str, payload: Dict[str, Any]) -> requests.Response:
-    return requests.patch(url, headers=headers(), json=payload, timeout=30)
-
-def query_product_by_sku(sku: str) -> Optional[Dict[str, Any]]:
-    """Cerca il prodotto per SKU con la query ufficiale (evita 404/scan)."""
-    payload = {
+def find_product_by_sku(sku):
+    body = {
         "query": {
             "filter": {"sku": str(sku)},
             "paging": {"limit": 1}
         }
     }
-    r = post(EP_PRODUCTS_QUERY, payload)
+    r = req("POST", "/stores/v1/products/query", json=body)
     if r.status_code != 200:
-        print(f"[WARN] Query SKU fallita {sku}: {r.status_code} {r.text[:160]}")
+        print(f"[WARN] Query SKU fallita {sku}: {r.status_code} {r.text}")
         return None
-    data = r.json() or {}
-    items = data.get("products") or data.get("items") or []
+    items = r.json().get("items", [])
     return items[0] if items else None
 
-def find_collection_id(name: str) -> Optional[str]:
-    nm = (name or "").strip()
-    if not nm:
-        return None
-    r = post(EP_COLLECTIONS_QUERY, {"query": {"filter": {}, "paging": {"limit": 100}}})
+def create_product(payload):
+    r = req("POST", "/stores/v1/products", json={"product": payload})
     if r.status_code != 200:
-        print(f"[WARN] Lettura categorie fallita: {r.status_code} {r.text[:160]}")
-        return None
-    data = r.json() or {}
-    items = data.get("collections") or data.get("items") or []
-    target = nm.lower()
-    for it in items:
-        if (it.get("name") or "").strip().lower() == target:
-            return it.get("id") or it.get("_id")
-    print(f"[WARN] Collection '{nm}' non trovata.")
-    return None
+        raise RuntimeError(f"POST /products fallita: {r.status_code} {r.text}")
+    return r.json().get("id") or r.json().get("_id") or r.json().get("product", {}).get("id")
 
-def add_to_collection(pid: str, cid: str) -> None:
-    r = post(EP_COLLECTION_ADD.format(cid=cid), {"productIds": [pid]})
+def update_product(pid, payload):
+    r = req("PATCH", f"/stores/v1/products/{pid}", json={"product": payload})
     if r.status_code != 200:
-        print(f"[WARN] Aggancio categoria fallito: {r.status_code} {r.text[:160]}")
-    else:
-        print(f"[INFO] Assegnato a collection id={cid}")
+        raise RuntimeError(f"PATCH /products/{pid} fallita: {r.status_code} {r.text}")
 
-def make_product_payload(row: Dict[str, str]) -> Dict[str, Any]:
-    name = short_name(row.get("nome_articolo", ""))
-    price = to_price(row.get("prezzo_eur", ""))
+def add_to_collection(collection_id, product_id):
+    if not collection_id:
+        return False
+    body = {"productIds": [product_id]}
+    r = req("POST", f"/stores/v1/collections/{collection_id}/products/add", json=body)
+    if r.status_code == 200:
+        return True
+    # smart collection o altro errore
+    print(f"[WARN] Assegnazione a collection fallita: {r.status_code} {r.text}")
+    return False
+
+def ensure_options_and_manage_variants(pid):
+    # Imposta l’opzione di pagamento e abilita la gestione varianti
+    payload = {
+        "manageVariants": True,
+        "productOptions": [
+            {
+                "name": OPTION_NAME,
+                "choices": [
+                    {"value": CHOICE_DEPOSIT},
+                    {"value": CHOICE_PREPAID}
+                ]
+            }
+        ]
+    }
+    update_product(pid, payload)
+
+def query_variants(pid):
+    # preferisco l'endpoint di query per avere fino a 100 risultati
+    body = {"query": {"filter": {}, "paging": {"limit": 100}}}
+    r = req("POST", f"/stores/v1/products/{pid}/variants/query", json=body)
+    if r.status_code == 200:
+        return r.json().get("items", [])
+    # fallback GET se la query non esistesse
+    r2 = req("GET", f"/stores/v1/products/{pid}/variants?limit=100")
+    if r2.status_code == 200:
+        return r2.json().get("variants", []) or r2.json().get("items", [])
+    raise RuntimeError(f"Query varianti fallita: {r.status_code} {r.text} / fallback {r2.status_code} {r2.text}")
+
+def patch_variants_by_id(pid, updates):
+    # updates = [{"id": "...", "priceData": {"price": "12.34"}} , ...]
+    r = req("PATCH", f"/stores/v1/products/{pid}/variants", json={"variants": updates})
+    if r.status_code != 200:
+        raise RuntimeError(f"PATCH /products/{pid}/variants fallita: {r.status_code} {r.text}")
+
+def build_description(preorder_deadline, eta, descr):
+    parts = []
+    if preorder_deadline:
+        parts.append(f"<p><strong>Preorder Deadline:</strong> {preorder_deadline}</p>")
+    if eta:
+        parts.append(f"<p><strong>ETA:</strong> {eta}</p>")
+    # riga vuota tra testata e corpo
+    parts.append("<p>&nbsp;</p>")
+    if descr:
+        safe = descr.replace("\n", "<br>")
+        parts.append(f"<div>{safe}</div>")
+    return "".join(parts)
+
+def row_to_product_payload(row):
+    nome = trunc(row.get("nome_articolo"), 80)
     sku = (row.get("sku") or "").strip()
     brand = (row.get("brand") or "").strip()
-    deadline = row.get("preorder_scadenza") or ""
-    eta = row.get("eta") or ""
-    body = row.get("descrizione") or ""
-    descr_html = build_description(deadline, eta, body)
+    raw_price = money_to_decimal(row.get("prezzo_eur"))
+    if not nome or not raw_price or not sku:
+        raise RuntimeError("nome_articolo, prezzo_eur, sku sono obbligatori.")
 
-    payload: Dict[str, Any] = {
-        "product": {
-            "name": name,
-            "visible": True,
-            "productType": "physical",
-            "sku": sku,
-            "description": descr_html,
-            "ribbon": "PREORDER",
-            "priceData": {"price": price},
-        }
-    }
-    if brand:
-        payload["product"]["brand"] = brand
-    return payload
+    descr_html = build_description(
+        row.get("preorder_scadenza") or row.get("preorder_deadline"),
+        row.get("eta"),
+        row.get("descrizione")
+    )
 
-def calc_variants(base_price: float) -> List[Dict[str, Any]]:
-    # ANTICIPO/SALDO = 30% del prezzo base
-    anticipo = round(base_price * 0.30, 2)
-    # PAGAMENTO ANTICIPATO = -5% sul prezzo base
-    anticipato = round(base_price * 0.95, 2)
-
-    option_name = "PREORDER PAYMENTS OPTIONS*"
-    return [
-        {
-            "choices": {option_name: "ANTICIPO/SALDO"},
-            "priceData": {"price": anticipo},
-            "visible": True
-        },
-        {
-            "choices": {option_name: "PAGAMENTO ANTICIPATO"},
-            "priceData": {"price": anticipato},
-            "visible": True
-        },
-    ]
-
-def apply_variants(pid: str, base_price: float) -> None:
-    option_name = "PREORDER PAYMENTS OPTIONS*"
     payload = {
-        "product": {
-            "productOptions": [
-                {
-                    "name": option_name,
-                    "choices": [
-                        {"value": "ANTICIPO/SALDO"},
-                        {"value": "PAGAMENTO ANTICIPATO"},
-                    ],
-                }
-            ],
-            # Definiamo direttamente le varianti complete (così "variants managed")
-            "variants": calc_variants(base_price),
-        }
+        "name": nome,
+        "sku": sku,
+        "brand": brand if brand else None,
+        "productType": "physical",
+        "priceData": {
+            "price": str(raw_price),
+            "currency": "EUR"
+        },
+        "ribbons": ["Preorder"],  # toppa visiva se il toggle "preorder" non è esposto via API
+        "description": descr_html,
+        "manageVariants": True,
+        "productOptions": [
+            {
+                "name": OPTION_NAME,
+                "choices": [
+                    {"value": CHOICE_DEPOSIT},
+                    {"value": CHOICE_PREPAID}
+                ]
+            }
+        ],
+        "visible": True
     }
-    r = patch(EP_PRODUCT_PATCH.format(pid=pid), payload)
-    if r.status_code != 200:
-        raise RuntimeError(f"PATCH varianti fallita: {r.status_code} {r.text[:200]}")
+    return payload, raw_price
 
-def upsert_row(row: Dict[str, str]) -> str:
-    name = short_name(row.get("nome_articolo", ""))
-    sku  = (row.get("sku") or "").strip()
-    cat  = (row.get("categoria") or "").strip()
-    price = to_price(row.get("prezzo_eur", ""))
+def match_collection_id(collections_map, wanted):
+    if not wanted:
+        return None
+    w = norm(wanted)
+    if w in collections_map:
+        return collections_map[w]
+    # match parziale tollerante
+    for k, v in collections_map.items():
+        if w in k or k in w:
+            return v
+    return None
 
-    # Proviamo la creazione
-    payload = make_product_payload(row)
-    r = post(EP_PRODUCTS_CREATE, payload)
-    if r.status_code == 200:
-        data = r.json() or {}
-        prod = data.get("product") or data
-        pid = prod.get("id")
-        if not pid:
-            raise RuntimeError("ID prodotto non ricevuto.")
-        print(f"[NEW] {name} (SKU={sku})")
-    else:
-        # SKU duplicato? Aggiorniamo quel prodotto
-        txt = (r.text or "").lower()
-        if r.status_code == 400 and "sku is not unique" in txt:
-            existing = query_product_by_sku(sku)
-            if not existing:
-                raise RuntimeError(f"SKU duplicato ma prodotto non trovato: {sku}")
-            pid = existing.get("id")
-            r2 = patch(EP_PRODUCT_PATCH.format(pid=pid), payload)
-            if r2.status_code != 200:
-                raise RuntimeError(f"PATCH fallita: {r2.status_code} {r2.text[:200]}")
-            print(f"[UPD] {name} (SKU={sku})")
-        else:
-            raise RuntimeError(f"POST fallita: {r.status_code} {r.text[:200]}")
-
-    # Varianti con prezzi corretti
-    try:
-        apply_variants(pid, price)
-        print(f"[OK] Varianti create: ANTICIPO/SALDO={round(price*0.30,2)}  PAGAMENTO ANTICIPATO={round(price*0.95,2)}")
-    except Exception as e:
-        print(f"[WARN] Varianti non applicate: {e}")
-
-    # Categoria (best-effort)
-    if cat:
-        cid = find_collection_id(cat)
-        if cid:
-            add_to_collection(pid, cid)
-        else:
-            print(f"[WARN] Categoria non agganciata: '{cat}'")
-
-    return pid
+def process_csv(csv_path):
+    cols = None
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=";")
+        cols = [c.strip() for c in reader.fieldnames]
+        required = {"nome_articolo","prezzo_eur","sku","brand","categoria","descrizione"}
+        missing = [c for c in required if c not in cols]
+        if missing:
+            raise RuntimeError(f"CSV mancano colonne: {missing}")
+        rows = list(reader)
+    return rows
 
 def main():
-    if len(sys.argv) < 2:
-        print("Uso: python3 wix_preorder_ingestion.py <CSV_V7>")
-        sys.exit(2)
-    csv_path = sys.argv[1]
-    rows = read_csv(csv_path)
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else CSV_DEFAULT_PATH
+    print(f"[INFO] CSV: {csv_path}")
 
-    errors = 0
-    for i, row in enumerate(rows, start=2):
-        name = short_name(row.get("nome_articolo", ""))
+    rows = process_csv(csv_path)
+    collections = get_collections()
+
+    created, updated, errors = 0, 0, 0
+
+    for idx, row in enumerate(rows, start=2):
         try:
-            upsert_row(row)
+            name_preview = trunc(row.get("nome_articolo"), 80)
+            sku = (row.get("sku") or "").strip()
+            if len(name_preview) == 80 and (row.get("nome_articolo") and len(row["nome_articolo"]) > 80):
+                print("[WARN] Nome > 80 caratteri, troncato.")
+
+            p = find_product_by_sku(sku)
+            product_exists = p is not None
+            pid = p.get("id") if product_exists else None
+
+            payload, base_price = row_to_product_payload(row)
+
+            if not product_exists:
+                pid = create_product(payload)
+                created += 1
+                print(f"[NEW] {name_preview} (SKU={sku}) id={pid}")
+            else:
+                update_product(pid, payload)
+                updated += 1
+                print(f"[UPD] {name_preview} (SKU={sku}) id={pid}")
+
+            # CATEGORIA
+            col_name = row.get("categoria")
+            col_id = match_collection_id(collections, col_name)
+            if col_id:
+                ok = add_to_collection(col_id, pid)
+                if ok:
+                    print(f"[OK] Categoria assegnata: {col_name}")
+                else:
+                    print(f"[WARN] Categoria '{col_name}' non assegnata (smart o errore).")
+            else:
+                print(f"[WARN] Categoria '{col_name}' non trovata.")
+
+            # VARIANTI E PREZZI
+            # Assicuro che esista l'opzione e che le varianti siano gestite
+            ensure_options_and_manage_variants(pid)
+
+            # Recupero varianti generate
+            variants = query_variants(pid)
+            if not variants:
+                raise RuntimeError("Nessuna variante generata.")
+
+            var_deposit_id = None
+            var_prepaid_id = None
+            for v in variants:
+                # "choices" può essere dict {OPTION_NAME: CHOICE}
+                choices = v.get("choices") or {}
+                # in certi payload choices è una lista di mappe: normalizzo in dict
+                if isinstance(choices, list):
+                    tmp = {}
+                    for ch in choices:
+                        # supporta forme diverse
+                        k = ch.get("name") or ch.get("option") or ch.get("title")
+                        val = ch.get("value") or ch.get("selection") or ch.get("description")
+                        if k and val:
+                            tmp[k] = val
+                    choices = tmp
+
+                pick = choices.get(OPTION_NAME)
+                if pick == CHOICE_DEPOSIT:
+                    var_deposit_id = v.get("id")
+                elif pick == CHOICE_PREPAID:
+                    var_prepaid_id = v.get("id")
+
+            if not var_deposit_id or not var_prepaid_id:
+                raise RuntimeError("Varianti attese non trovate (controlla nomi esatti di opzione/scelte).")
+
+            price_deposit = pct(base_price, "0.30")
+            price_prepaid = pct(base_price, "0.95")
+
+            updates = []
+            updates.append({"id": var_deposit_id, "priceData": {"price": str(price_deposit), "currency": "EUR"}})
+            updates.append({"id": var_prepaid_id, "priceData": {"price": str(price_prepaid), "currency": "EUR"}})
+
+            patch_variants_by_id(pid, updates)
+            print(f"[OK] Prezzi varianti aggiornati: {CHOICE_DEPOSIT}={price_deposit} EUR, {CHOICE_PREPAID}={price_prepaid} EUR")
+
         except Exception as e:
             errors += 1
-            print(f"[ERRORE] Riga {i} '{name}': {e}")
+            print(f"[ERRORE] Riga {idx} '{trunc(row.get('nome_articolo'),50)}': {e}")
 
-    print(f"[DONE] Errori: {errors}")
+    print(f"[DONE] Creati: {created}, Aggiornati: {updated}, Errori: {errors}")
     if errors:
         sys.exit(2)
 
 if __name__ == "__main__":
     main()
+main()
