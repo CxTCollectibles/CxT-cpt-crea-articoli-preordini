@@ -1,15 +1,10 @@
-name: Importa Preordini (Baseline Semplice)
+name: importa_preordini
 
 on:
   workflow_dispatch:
-    inputs:
-      csv_path:
-        description: "Percorso CSV V7 (es: input/template_preordini_v7.csv)"
-        required: true
-        default: "input/template_preordini_v7.csv"
 
 jobs:
-  importa:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,12 +16,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests
-
-      - name: Run importer
-        env:
-          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
         run: |
-          set -e
-          python3 wix_preorder_ingestion.py "${{ github.event.inputs.csv_path }}"
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Importa/aggiorna prodotti da CSV
+        env:
+          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+          WIX_AUTH_HEADER: ${{ secrets.WIX_AUTH_HEADER }}
+        run: |
+          python3 wix_preorder_ingestion.py "input/template_preordini_v7.csv"
