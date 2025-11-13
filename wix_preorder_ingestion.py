@@ -11,15 +11,14 @@ import requests
 CSV_DEFAULT = "input/template_preordini_v7.csv"
 
 WIX_API_BASE = "https://www.wixapis.com"
-WIX_API_KEY = os.environ.get("WIX_API_KEY")
-WIX_SITE_ID = os.environ.get("WIX_SITE_ID")
+WIX_API_KEY  = os.environ.get("WIX_API_KEY")
+WIX_SITE_ID  = os.environ.get("WIX_SITE_ID")
 
-# Varianti/prezzi
-DEPOSIT_PCT = Decimal("0.30")        # 30% ANTICIPO/SALDO
-EARLY_PAY_DISC = Decimal("0.05")     # 5% sconto PAGAMENTO ANTICIPATO
-OPTION_TITLE = "PREORDER PAYMENTS OPTIONS*"
-CHOICE_DEPOSIT = "ANTICIPO/SALDO"
-CHOICE_EARLY = "PAGAMENTO ANTICIPATO"
+DEPOSIT_PCT     = Decimal("0.30")   # ANTICIPO/SALDO = 30%
+EARLY_PAY_DISC  = Decimal("0.05")   # PAGAMENTO ANTICIPATO = -5%
+OPTION_TITLE    = "PREORDER PAYMENTS OPTIONS*"
+CHOICE_DEPOSIT  = "ANTICIPO/SALDO"
+CHOICE_EARLY    = "PAGAMENTO ANTICIPATO"
 
 # ================== HTTP ==================
 def headers():
@@ -37,7 +36,7 @@ def req(method: str, path: str, payload: dict | None = None):
     r = requests.request(method, url, headers=headers(), data=data, timeout=30)
     if r.status_code >= 400:
         raise RuntimeError(f"{method} {path} failed {r.status_code}: {r.text}")
-    if not r.text.strip():
+    if not (r.text or "").strip():
         return {}
     try:
         return r.json()
@@ -45,9 +44,9 @@ def req(method: str, path: str, payload: dict | None = None):
         return {}
 
 # ================== UTIL ==================
-def money(val) -> float:
-    d = Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return float(d)
+def money(d: Decimal | float | str) -> float:
+    q = Decimal(str(d)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(q)
 
 def norm_price(raw: str) -> Decimal:
     if raw is None:
@@ -63,7 +62,7 @@ def safe_name(name: str) -> str:
     return name
 
 # ================== CSV ==================
-COLS = [
+REQUIRED_COLS = [
     "nome_articolo", "prezzo_eur", "sku", "brand",
     "categoria", "descrizione", "preorder_scadenza", "eta"
 ]
@@ -71,42 +70,53 @@ COLS = [
 def read_csv(path: str):
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
         rd = csv.DictReader(fh, delimiter=";")
-        missing = [c for c in COLS if c not in rd.fieldnames]
+        missing = [c for c in REQUIRED_COLS if c not in rd.fieldnames]
         if missing:
             raise RuntimeError(f"CSV mancano colonne: {missing}")
         for i, row in enumerate(rd, start=2):
             yield i, row
 
-# ================== PRODOTTI ==================
-def query_product_by_sku(sku: str) -> dict | None:
-    # Wix vuole il filtro come stringa (non oggetto)
-    body = {"query": {"filter": f'sku eq "{sku}"', "paging": {"limit": 1}}}
-    try:
-        res = req("POST", "/stores-reader/v1/products/query", body)
-        items = (res or {}).get("items") or []
-        return items[0] if items else None
-    except Exception as e:
-        print(f"[WARN] Query SKU fallita {sku}: {e}")
-        try:
-            res = req("POST", "/stores/v1/products/query", body)
-            items = (res or {}).get("items") or []
-            return items[0] if items else None
-        except Exception as e2:
-            print(f"[WARN] Query SKU (fallback) fallita {sku}: {e2}")
-            return None
+# ================== LOOKUP PRODOTTI ==================
+def query_page(limit=100, cursor=None):
+    body = {"query": {"paging": {"limit": limit}}}
+    if cursor:
+        body["query"]["paging"]["cursor"] = cursor
+    return req("POST", "/stores/v1/products/query", body)
 
+def find_by_sku_scan(sku: str) -> dict | None:
+    """Scansione paginata senza filtri (evita l'errore del parser filtro)."""
+    cursor = None
+    seen = 0
+    for _ in range(50):  # guardrail
+        res = query_page(limit=100, cursor=cursor)
+        items = (res or {}).get("items") or []
+        for it in items:
+            if str(it.get("sku", "")).strip() == sku:
+                return it
+        # paging può stare a top-level o sotto 'paging'
+        cursor = (res.get("paging") or {}).get("nextCursor") or res.get("nextCursor")
+        seen += len(items)
+        if not cursor or not items:
+            break
+    return None
+
+# ================== DESCRIZIONE ==================
 def build_description(preorder_scadenza: str, eta: str, descr: str) -> str:
+    preorder_scadenza = (preorder_scadenza or "").strip()
+    eta = (eta or "").strip()
+    descr = (descr or "").strip()
     parts = []
     if preorder_scadenza:
         parts.append(f"PREORDER DEADLINE: {preorder_scadenza}")
     if eta:
         parts.append(f"ETA: {eta}")
     if parts:
-        parts.append("")  # riga vuota
+        parts.append("")  # riga vuota fra header e corpo
     if descr:
         parts.append(descr)
     return "\n".join(parts)
 
+# ================== CREATE / PATCH ==================
 def create_product(name: str, price: Decimal, sku: str, brand: str, description: str) -> str:
     descr_deposit = f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"
     descr_early   = f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"
@@ -143,62 +153,68 @@ def patch_product(product_id: str, name: str, price: Decimal, brand: str, descri
             "description": description or "",
             "priceData": {"price": money(price)},
             "productType": "physical",
-            "manageVariants": True,
+            "manageVariants": True
         }
     }
     req("PATCH", f"/stores/v1/products/{product_id}", body)
 
 # ================== VARIANTI ==================
-def ensure_option(product_id: str) -> str:
-    # Garantisce che esista OPTION_TITLE con scelte e descrizioni non vuote
-    prod = req("GET", f"/stores/v1/products/{product_id}")
-    product = prod.get("product", {}) if isinstance(prod, dict) else {}
-    opts = product.get("productOptions") or []
+def get_product(product_id: str) -> dict:
+    res = req("GET", f"/stores/v1/products/{product_id}")
+    return res.get("product", {}) if isinstance(res, dict) else {}
 
+def ensure_option(product_id: str) -> str:
+    """Garantisce l'esistenza dell'opzione e ritorna il nome esatto da usare come 'title' nel PATCH variants."""
     descr_deposit = f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"
     descr_early   = f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"
 
-    for opt in opts:
-        choices = opt.get("choices") or []
-        values_upper = [ (c or {}).get("value","").strip().upper() for c in choices ]
-        if CHOICE_DEPOSIT in values_upper and CHOICE_EARLY in values_upper:
-            changed = False
-            for ch in choices:
-                if ch.get("value") == CHOICE_DEPOSIT and not (ch.get("description") or "").strip():
-                    ch["description"] = descr_deposit; changed = True
-                if ch.get("value") == CHOICE_EARLY and not (ch.get("description") or "").strip():
-                    ch["description"] = descr_early; changed = True
-            if not product.get("manageVariants"):
-                product["manageVariants"] = True; changed = True
-            if changed:
-                req("PATCH", f"/stores/v1/products/{product_id}", {"product": {"productOptions": opts, "manageVariants": True}})
-                time.sleep(0.4)
-            # Il PATCH variants richiede "title" = nome dell'opzione
-            return opt.get("name") or opt.get("title") or OPTION_TITLE
+    # retry per consistenza Wix
+    for attempt in range(8):
+        prod = get_product(product_id)
+        opts = prod.get("productOptions") or []
+        for opt in opts:
+            values = [ (c or {}).get("value","").strip().upper() for c in (opt.get("choices") or []) ]
+            if CHOICE_DEPOSIT.upper() in values and CHOICE_EARLY.upper() in values:
+                # riempi descrizioni se vuote
+                changed = False
+                for ch in (opt.get("choices") or []):
+                    if ch.get("value","").strip().upper() == CHOICE_DEPOSIT.upper() and not (ch.get("description") or "").strip():
+                        ch["description"] = descr_deposit; changed = True
+                    if ch.get("value","").strip().upper() == CHOICE_EARLY.upper() and not (ch.get("description") or "").strip():
+                        ch["description"] = descr_early; changed = True
+                if not prod.get("manageVariants"):
+                    changed = True
+                if changed:
+                    req("PATCH", f"/stores/v1/products/{product_id}", {
+                        "product": {"productOptions": opts, "manageVariants": True}
+                    })
+                    time.sleep(0.5)
+                return opt.get("name") or opt.get("title") or OPTION_TITLE
 
-    patch_body = {
-        "product": {
-            "manageVariants": True,
-            "productOptions": [
-                {
-                    "name": OPTION_TITLE,
-                    "choices": [
-                        {"value": CHOICE_DEPOSIT, "description": descr_deposit},
-                        {"value": CHOICE_EARLY,   "description": descr_early},
-                    ],
-                }
-            ],
-        }
-    }
-    req("PATCH", f"/stores/v1/products/{product_id}", patch_body)
-    time.sleep(0.6)
+        # se non c'è ancora, la creo
+        req("PATCH", f"/stores/v1/products/{product_id}", {
+            "product": {
+                "manageVariants": True,
+                "productOptions": [
+                    {
+                        "name": OPTION_TITLE,
+                        "choices": [
+                            {"value": CHOICE_DEPOSIT, "description": descr_deposit},
+                            {"value": CHOICE_EARLY,   "description": descr_early},
+                        ],
+                    }
+                ],
+            }
+        })
+        time.sleep(0.8)  # dagli tempo a generare le varianti
+
+    # ultimo fallback: restituisco comunque il nome standard
     return OPTION_TITLE
 
 def set_variant_prices(product_id: str, option_name: str, base_price: Decimal):
     price_deposit = (base_price * DEPOSIT_PCT).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     price_early   = (base_price * (Decimal("1") - EARLY_PAY_DISC)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    # ATTENZIONE: Wix si aspetta choices come LISTA di oggetti {title, description}
     body = {
         "variants": [
             {
@@ -215,8 +231,7 @@ def set_variant_prices(product_id: str, option_name: str, base_price: Decimal):
 
 def apply_preorder_variants(product_id: str, base_price: Decimal):
     opt_name = ensure_option(product_id)
-    # piccolo ritardo per coerenza interna di Wix
-    time.sleep(0.4)
+    time.sleep(0.5)
     set_variant_prices(product_id, opt_name, base_price)
 
 # ================== MAIN ==================
@@ -224,53 +239,49 @@ def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else CSV_DEFAULT
     print(f"[INFO] CSV: {csv_path}")
 
-    created = 0
-    updated = 0
-    errors = 0
+    done = 0
+    errs = 0
 
     for rownum, row in read_csv(csv_path):
-        name = safe_name(row.get("nome_articolo", ""))
-        try:
-            sku = str(row.get("sku", "")).strip()
-            brand = (row.get("brand") or "").strip()
-            prezzo = norm_price(row.get("prezzo_eur", "0"))
-            descrizione = build_description(
-                row.get("preorder_scadenza", "").strip(),
-                row.get("eta", "").strip(),
-                (row.get("descrizione") or "").strip()
-            )
+        name  = safe_name(row.get("nome_articolo", ""))
+        sku   = (row.get("sku") or "").strip()
+        brand = (row.get("brand") or "").strip()
+        price = norm_price(row.get("prezzo_eur"))
+        descr = build_description(row.get("preorder_scadenza"), row.get("eta"), row.get("descrizione"))
 
+        try:
             print(f"[WORK] {name} (SKU={sku})")
 
-            existing = query_product_by_sku(sku)
-            if not existing:
+            prod = find_by_sku_scan(sku)
+            if not prod:
+                # crea
                 try:
-                    product_id = create_product(name, prezzo, sku, brand, descrizione)
-                    print(f"[NEW] Creato {sku} -> {product_id}")
-                    created += 1
-                except Exception as ce:
-                    if "sku is not unique" in str(ce).lower():
-                        existing = query_product_by_sku(sku)
-                        if not existing:
+                    pid = create_product(name, price, sku, brand, descr)
+                    print(f"[NEW] Creato {sku} -> {pid}")
+                except Exception as e:
+                    # se Wix urla "sku is not unique", rifaccio la scansione e prendo l'ID
+                    if "sku is not unique" in str(e).lower():
+                        prod = find_by_sku_scan(sku)
+                        if not prod:
                             raise
-                        product_id = existing.get("id")
-                        print(f"[INFO] SKU duplicato, uso esistente {product_id}")
+                        pid = prod.get("id")
+                        print(f"[INFO] SKU già presente, uso {pid}")
                     else:
                         raise
             else:
-                product_id = existing.get("id")
-                patch_product(product_id, name, prezzo, brand, descrizione)
-                print(f"[UPD] Aggiornato {sku} -> {product_id}")
-                updated += 1
+                pid = prod.get("id")
+                patch_product(pid, name, price, brand, descr)
+                print(f"[UPD] Aggiornato {sku} -> {pid}")
 
-            apply_preorder_variants(product_id, prezzo)
+            apply_preorder_variants(pid, price)
+            done += 1
 
         except Exception as e:
             print(f"[ERRORE] Riga {rownum} '{name}': {e}")
-            errors += 1
+            errs += 1
 
-    print(f"[DONE] Creati/Aggiornati: {created+updated}, Errori: {errors}")
-    if errors:
+    print(f"[DONE] Creati/Aggiornati: {done}, Errori: {errs}")
+    if errs:
         sys.exit(2)
 
 if __name__ == "__main__":
