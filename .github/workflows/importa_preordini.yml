@@ -1,14 +1,21 @@
-name: importa_preordini
+name: Importa Preordini (V7)
 
 on:
   workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Percorso CSV"
+        required: false
+        default: "input/template_preordini_v7.csv"
 
 jobs:
-  run:
+  importa:
     runs-on: ubuntu-latest
 
     env:
-      CSV_PATH: input/template_preordini_v7.csv
+      WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+      WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
+      CSV_PATH: ${{ inputs.csv_path }}
 
     steps:
       - name: Checkout
@@ -22,65 +29,24 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests python-dateutil
 
-      - name: Preflight API (Python, no shell tools)
-        env:
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}         # metaSiteId (obbligatorio)
-          WIX_SITE_ID_ALT: ${{ secrets.WIX_SITE_ID_ALT }} # siteId “corto” (opzionale)
-          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+      - name: Preflight Wix (Catalog Version)
+        shell: python
         run: |
-          python - <<'PY'
           import os, sys, requests
-
           base = "https://www.wixapis.com"
-          api_key = os.environ.get("WIX_API_KEY", "").strip()
-          msid    = os.environ.get("WIX_SITE_ID", "").strip()
-          sid_alt = os.environ.get("WIX_SITE_ID_ALT", "").strip()
+          headers = {"Authorization": os.environ["WIX_API_KEY"], "wix-site-id": os.environ["WIX_SITE_ID"]}
+          r = requests.get(f"{base}/stores/v3/provision/version", headers=headers)
+          print("Status:", r.status_code)
+          if r.status_code == 200:
+              print("Body:", r.text)
+          else:
+              print("Headers:", dict(r.headers))
+          if r.status_code == 404:
+              print("Preflight 404: molto probabilmente il catalogo è V3 e gli endpoint V1 non sono disponibili, oppure chiave senza permessi Stores.")
+              sys.exit(2)
 
-          if not api_key:
-            print("WIX_API_KEY mancante"); sys.exit(1)
-          if not msid:
-            print("WIX_SITE_ID mancante (serve il metaSiteId)"); sys.exit(1)
-
-          sites = [msid] + ([sid_alt] if sid_alt else [])
-          auths = [api_key, f"Bearer {api_key}"]
-          paths = ["/stores/v1/collections?limit=1", "/stores/v1/products?limit=1"]
-
-          ok = False
-          for auth in auths:
-            for site in sites:
-              for path in paths:
-                try:
-                  print(f">>> Test Authorization='{auth.split()[0]}' wix-site-id={site} GET {path}")
-                  r = requests.get(base + path, headers={
-                    "Authorization": auth,
-                    "wix-site-id": site
-                  }, timeout=20)
-                  print("HTTP", r.status_code)
-                  if r.status_code == 200:
-                    ok = True
-                    break
-                  else:
-                    print("Headers:", dict(r.headers))
-                    print("Body:", r.text[:400])
-                except Exception as e:
-                  print("EXC:", e)
-              if ok: break
-            if ok: break
-
-          if not ok:
-            print("Preflight fallito. Possibili cause:")
-            print("1) Permessi Stores mancanti alla API key")
-            print("2) wix-site-id non allineato (metaSiteId vs siteId)")
-            print("3) Formato Authorization non accettato (raw/Bearer)")
-            sys.exit(2)
-          PY
-
-      - name: Importa/aggiorna prodotti da CSV
-        env:
-          WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          WIX_SITE_ID_ALT: ${{ secrets.WIX_SITE_ID_ALT }}
-          WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
+      - name: Run ingestion
         run: |
           python3 wix_preorder_ingestion.py "$CSV_PATH"
