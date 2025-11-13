@@ -1,280 +1,236 @@
 #!/usr/bin/env python3
 import os
-import sys
 import csv
 import json
+import sys
 import time
-from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, Any, Tuple
 import requests
 
-# ================== CONFIG ==================
-CSV_DEFAULT = "input/template_preordini_v7.csv"
+BASE = "https://www.wixapis.com"
 
-WIX_API_BASE = "https://www.wixapis.com"
-WIX_API_KEY  = os.environ.get("WIX_API_KEY")
-WIX_SITE_ID  = os.environ.get("WIX_SITE_ID")
+WIX_API_KEY = os.environ.get("WIX_API_KEY", "").strip()
+WIX_SITE_ID = os.environ.get("WIX_SITE_ID", "").strip()
+CSV_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("CSV_PATH", "input/template_preordini_v7.csv")
 
-DEPOSIT_PCT     = Decimal("0.30")   # ANTICIPO/SALDO = 30%
-EARLY_PAY_DISC  = Decimal("0.05")   # PAGAMENTO ANTICIPATO = -5%
-OPTION_TITLE    = "PREORDER PAYMENTS OPTIONS*"
-CHOICE_DEPOSIT  = "ANTICIPO/SALDO"
-CHOICE_EARLY    = "PAGAMENTO ANTICIPATO"
+# Percentuale anticipo: di default 30%. Cambiabile da env.
+try:
+    DEPOSIT_PCT = float(os.environ.get("DEPOSIT_PCT", "0.30"))
+except:
+    DEPOSIT_PCT = 0.30
 
-# ================== HTTP ==================
-def headers():
+def headers() -> Dict[str, str]:
     if not WIX_API_KEY or not WIX_SITE_ID:
-        raise RuntimeError("WIX_API_KEY e/o WIX_SITE_ID mancanti.")
+        print("[FATAL] Variabili WIX_API_KEY o WIX_SITE_ID mancanti.", file=sys.stderr)
+        sys.exit(1)
     return {
-        "Authorization": WIX_API_KEY,
+        "Authorization": f"Bearer {WIX_API_KEY}",
         "wix-site-id": WIX_SITE_ID,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
-def req(method: str, path: str, payload: dict | None = None):
-    url = f"{WIX_API_BASE}{path}"
+def req(method: str, path: str, payload: Dict[str, Any] = None, ok=(200,201)) -> Tuple[int, Dict[str, Any]]:
+    url = f"{BASE}{path}"
     data = json.dumps(payload) if payload is not None else None
     r = requests.request(method, url, headers=headers(), data=data, timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{method} {path} failed {r.status_code}: {r.text}")
-    if not (r.text or "").strip():
-        return {}
+    if r.status_code not in ok:
+        # tenta di estrarre body testuale per log chiaro
+        body = r.text
+        raise RuntimeError(f"{method} {path} failed {r.status_code}: {body}")
+    if r.text.strip() == "":
+        return r.status_code, {}
     try:
-        return r.json()
-    except Exception:
-        return {}
+        return r.status_code, r.json()
+    except:
+        return r.status_code, {}
 
-# ================== UTIL ==================
-def money(d: Decimal | float | str) -> float:
-    q = Decimal(str(d)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return float(q)
+def eur(v: float) -> float:
+    # arrotondamento due decimali in stile e-commerce
+    return round(float(v) + 1e-9, 2)
 
-def norm_price(raw: str) -> Decimal:
-    if raw is None:
-        return Decimal("0")
-    s = str(raw).strip().replace(",", ".")
-    return Decimal(s) if s else Decimal("0")
+def build_description(preorder_deadline: str, eta: str, descr_it: str) -> str:
+    # Richiesta: riga "Preorder Deadline" e "ETA", una riga vuota, poi descrizione.
+    # Evito backslash in f-string usando variabili intermedie.
+    pd = preorder_deadline.strip() if preorder_deadline else ""
+    et = eta.strip() if eta else ""
+    di = descr_it.strip() if descr_it else ""
+    di_html = di.replace("\n", "<br>")
 
-def safe_name(name: str) -> str:
-    name = (name or "").strip()
-    if len(name) > 80:
-        print("[WARN] Nome > 80 caratteri, troncato.")
-        name = name[:80]
-    return name
-
-# ================== CSV ==================
-REQUIRED_COLS = [
-    "nome_articolo", "prezzo_eur", "sku", "brand",
-    "categoria", "descrizione", "preorder_scadenza", "eta"
-]
-
-def read_csv(path: str):
-    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
-        rd = csv.DictReader(fh, delimiter=";")
-        missing = [c for c in REQUIRED_COLS if c not in rd.fieldnames]
-        if missing:
-            raise RuntimeError(f"CSV mancano colonne: {missing}")
-        for i, row in enumerate(rd, start=2):
-            yield i, row
-
-# ================== LOOKUP PRODOTTI ==================
-def query_page(limit=100, cursor=None):
-    body = {"query": {"paging": {"limit": limit}}}
-    if cursor:
-        body["query"]["paging"]["cursor"] = cursor
-    return req("POST", "/stores/v1/products/query", body)
-
-def find_by_sku_scan(sku: str) -> dict | None:
-    """Scansione paginata senza filtri (evita errori parser su filter)."""
-    cursor = None
-    for _ in range(50):  # guardrail
-        res = query_page(limit=100, cursor=cursor)
-        items = (res or {}).get("items") or []
-        for it in items:
-            if str(it.get("sku", "")).strip() == sku:
-                return it
-        cursor = (res.get("paging") or {}).get("nextCursor") or res.get("nextCursor")
-        if not cursor or not items:
-            break
-    return None
-
-# ================== DESCRIZIONE ==================
-def build_description(preorder_scadenza: str, eta: str, descr: str) -> str:
-    preorder_scadenza = (preorder_scadenza or "").strip()
-    eta = (eta or "").strip()
-    descr = (descr or "").strip()
     parts = []
-    if preorder_scadenza:
-        parts.append(f"PREORDER DEADLINE: {preorder_scadenza}")
-    if eta:
-        parts.append(f"ETA: {eta}")
-    if parts:
-        parts.append("")  # riga vuota fra header e corpo
-    if descr:
-        parts.append(descr)
+    if pd:
+        parts.append(f"<p><strong>Preorder Deadline:</strong> {pd}</p>")
+    if et:
+        parts.append(f"<p><strong>ETA:</strong> {et}</p>")
+    # riga vuota
+    parts.append("<p>&nbsp;</p>")
+    if di_html:
+        parts.append(f"<p>{di_html}</p>")
     return "\n".join(parts)
 
-# ================== CREATE / PATCH ==================
-def create_product(name: str, price: Decimal, sku: str, brand: str, description: str) -> str:
-    descr_deposit = f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"
-    descr_early   = f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"
+def create_product(row: Dict[str, str]) -> Tuple[str, str]:
+    """
+    Crea un prodotto base (senza varianti).
+    Ritorna (product_id, revision) dove revision qui non serve per v1.
+    """
+    nome = (row.get("nome_articolo") or "").strip()
+    prezzo_str = (row.get("prezzo_eur") or "0").replace(",", ".")
+    sku = (row.get("sku") or "").strip()
+    brand = (row.get("brand") or "").strip()
+    descr = (row.get("descrizione") or "").strip()
+    preorder_scadenza = (row.get("preorder_scadenza") or row.get("preorder_deadline") or "").strip()
+    eta = (row.get("eta") or "").strip()
+
+    if not sku:
+        raise RuntimeError("SKU mancante")
+
+    try:
+        prezzo = float(prezzo_str)
+    except:
+        prezzo = 0.0
+
+    descr_html = build_description(preorder_scadenza, eta, descr)
 
     body = {
         "product": {
+            "name": nome[:80] if nome else sku,
             "productType": "physical",
-            "name": name,
-            "sku": str(sku),
-            "brand": brand or "",
-            "description": description or "",
-            "priceData": {"price": money(price)},
-            "visible": True,
+            "sku": sku,
+            "priceData": {
+                "currency": "EUR",
+                "price": eur(prezzo)
+            },
+            # Il campo brand funziona come oggetto con name
+            "brand": {"name": brand} if brand else None,
+            "description": descr_html,
+            "visible": True
+        }
+    }
+    # rimuovi chiavi None che Wix odia
+    body["product"] = {k: v for k, v in body["product"].items() if v is not None}
+
+    status, js = req("POST", "/stores/v1/products", body, ok=(200,201))
+    pid = js.get("product", {}).get("id")
+    if not pid:
+        raise RuntimeError(f"Creazione prodotto senza id. Risposta: {js}")
+    return pid, js.get("product", {}).get("revision", "")
+
+def patch_options_and_variants(product_id: str, sku_base: str, full_price: float):
+    """
+    Imposta:
+      - 1 opzione: PREORDER PAYMENTS OPTIONS*
+      - 2 scelte: ANTICIPO/SALDO, PAGAMENTO ANTICIPATO
+      - 2 varianti con prezzi calcolati
+    NOTA: per v1, le scelte richiedono 'value' (ID interno) e 'description' (testo visibile).
+          Le varianti vanno referenziate con la 'description' della scelta.
+    """
+    deposit = eur(full_price * DEPOSIT_PCT)
+
+    option_name = "PREORDER PAYMENTS OPTIONS*"
+    choice_deposit_desc = "ANTICIPO/SALDO"
+    choice_deposit_val = "AS"
+    choice_full_desc = "PAGAMENTO ANTICIPATO"
+    choice_full_val = "PA"
+
+    body = {
+        "product": {
             "manageVariants": True,
             "productOptions": [
                 {
-                    "name": OPTION_TITLE,
+                    "name": option_name,
+                    "type": "drop_down",
                     "choices": [
-                        {"value": CHOICE_DEPOSIT, "description": descr_deposit},
-                        {"value": CHOICE_EARLY,   "description": descr_early},
-                    ],
+                        {
+                            "value": choice_deposit_val,
+                            "description": choice_deposit_desc
+                        },
+                        {
+                            "value": choice_full_val,
+                            "description": choice_full_desc
+                        }
+                    ]
                 }
             ],
+            "variants": [
+                {
+                    # Attenzione: qui Wix si aspetta un OBJECT { "<nome_opzione>": "<description scelta>" }
+                    "choices": {
+                        option_name: choice_deposit_desc
+                    },
+                    "priceData": {
+                        "currency": "EUR",
+                        "price": deposit
+                    },
+                    "visible": True,
+                    "sku": f"{sku_base}-AS"
+                },
+                {
+                    "choices": {
+                        option_name: choice_full_desc
+                    },
+                    "priceData": {
+                        "currency": "EUR",
+                        "price": eur(full_price)
+                    },
+                    "visible": True,
+                    "sku": f"{sku_base}-PA"
+                }
+            ]
         }
     }
-    res = req("POST", "/stores/v1/products", body)
-    return (res.get("product") or {}).get("id")
+    # PATCH prodotto con opzioni e varianti
+    req("PATCH", f"/stores/v1/products/{product_id}", body, ok=(200,))
 
-def patch_product(product_id: str, name: str, price: Decimal, brand: str, description: str):
-    body = {
-        "product": {
-            "name": name,
-            "brand": brand or "",
-            "description": description or "",
-            "priceData": {"price": money(price)},
-            "productType": "physical",
-            "manageVariants": True
-        }
-    }
-    req("PATCH", f"/stores/v1/products/{product_id}", body)
+def load_csv(path: str):
+    # Expect utf-8-sig e separatore ';' come da XLS V7
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=";")
+        # Mappatura minima: nomi già in V7
+        required = ["nome_articolo", "prezzo_eur", "sku", "brand", "descrizione", "preorder_scadenza", "eta"]
+        missing = [c for c in required if c not in reader.fieldnames]
+        if missing:
+            print(f"[WARN] CSV colonne mancanti: {missing}. Procedo dove posso.")
+        for row in reader:
+            yield row
 
-# ================== VARIANTI ==================
-def get_product(product_id: str) -> dict:
-    res = req("GET", f"/stores/v1/products/{product_id}")
-    return res.get("product", {}) if isinstance(res, dict) else {}
-
-def ensure_option(product_id: str) -> str:
-    """Garantisce l'opzione e ritorna il nome esatto da usare come 'key' del dict choices."""
-    descr_deposit = f"Paga {int(DEPOSIT_PCT*100)}% ora, saldo alla disponibilità"
-    descr_early   = f"Pagamento immediato con sconto {int(EARLY_PAY_DISC*100)}%"
-
-    for attempt in range(8):
-        prod = get_product(product_id)
-        opts = prod.get("productOptions") or []
-        for opt in opts:
-            values = [ (c or {}).get("value","").strip().upper() for c in (opt.get("choices") or []) ]
-            if CHOICE_DEPOSIT.upper() in values and CHOICE_EARLY.upper() in values:
-                changed = False
-                for ch in (opt.get("choices") or []):
-                    if ch.get("value","").strip().upper() == CHOICE_DEPOSIT.upper() and not (ch.get("description") or "").strip():
-                        ch["description"] = descr_deposit; changed = True
-                    if ch.get("value","").strip().upper() == CHOICE_EARLY.upper() and not (ch.get("description") or "").strip():
-                        ch["description"] = descr_early; changed = True
-                if not prod.get("manageVariants"):
-                    changed = True
-                if changed:
-                    req("PATCH", f"/stores/v1/products/{product_id}", {
-                        "product": {"productOptions": opts, "manageVariants": True}
-                    })
-                    time.sleep(0.5)
-                return opt.get("name") or opt.get("title") or OPTION_TITLE
-
-        # se non c'è, la creo ora
-        req("PATCH", f"/stores/v1/products/{product_id}", {
-            "product": {
-                "manageVariants": True,
-                "productOptions": [
-                    {
-                        "name": OPTION_TITLE,
-                        "choices": [
-                            {"value": CHOICE_DEPOSIT, "description": descr_deposit},
-                            {"value": CHOICE_EARLY,   "description": descr_early},
-                        ],
-                    }
-                ],
-            }
-        })
-        time.sleep(0.8)  # tempo perché Wix generi le varianti
-
-    return OPTION_TITLE
-
-def set_variant_prices(product_id: str, option_name: str, base_price: Decimal):
-    price_deposit = (base_price * DEPOSIT_PCT).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    price_early   = (base_price * (Decimal("1") - EARLY_PAY_DISC)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-    # *** QUI il formato richiesto da Wix v1: choices = oggetto { "NomeOpzione": "ValoreScelta" }
-    body = {
-        "variants": [
-            {
-                "choices": { option_name: CHOICE_DEPOSIT },
-                "priceData": { "price": money(price_deposit) }
-            },
-            {
-                "choices": { option_name: CHOICE_EARLY },
-                "priceData": { "price": money(price_early) }
-            },
-        ]
-    }
-    req("PATCH", f"/stores/v1/products/{product_id}/variants", body)
-
-def apply_preorder_variants(product_id: str, base_price: Decimal):
-    opt_name = ensure_option(product_id)
-    time.sleep(0.5)
-    set_variant_prices(product_id, opt_name, base_price)
-
-# ================== MAIN ==================
 def main():
-    csv_path = sys.argv[1] if len(sys.argv) > 1 else CSV_DEFAULT
-    print(f"[INFO] CSV: {csv_path}")
+    print(f"[INFO] CSV: {CSV_PATH}")
+    created = 0
+    errors = 0
 
-    done = 0
-    errs = 0
+    for row in load_csv(CSV_PATH):
+        nome = (row.get("nome_articolo") or "").strip()
+        sku = (row.get("sku") or "").strip()
+        prezzo_str = (row.get("prezzo_eur") or "0").replace(",", ".")
+        try:
+            prezzo = float(prezzo_str)
+        except:
+            prezzo = 0.0
 
-    for rownum, row in read_csv(csv_path):
-        name  = safe_name(row.get("nome_articolo", ""))
-        sku   = (row.get("sku") or "").strip()
-        brand = (row.get("brand") or "").strip()
-        price = norm_price(row.get("prezzo_eur"))
-        descr = build_description(row.get("preorder_scadenza"), row.get("eta"), row.get("descrizione"))
+        display = nome[:80] if nome else sku
+        print(f"[WORK] {display} (SKU={sku})")
 
         try:
-            print(f"[WORK] {name} (SKU={sku})")
+            # 1) crea base
+            pid, _rev = create_product(row)
+            print(f"[NEW] Creato {sku} -> {pid}")
 
-            prod = find_by_sku_scan(sku)
-            if not prod:
-                try:
-                    pid = create_product(name, price, sku, brand, descr)
-                    print(f"[NEW] Creato {sku} -> {pid}")
-                except Exception as e:
-                    if "sku is not unique" in str(e).lower():
-                        prod = find_by_sku_scan(sku)
-                        if not prod:
-                            raise
-                        pid = prod.get("id")
-                        print(f"[INFO] SKU già presente, uso {pid}")
-                    else:
-                        raise
-            else:
-                pid = prod.get("id")
-                patch_product(pid, name, price, brand, descr)
-                print(f"[UPD] Aggiornato {sku} -> {pid}")
+            # 2) patch opzioni + varianti con prezzi
+            try:
+                patch_options_and_variants(pid, sku, prezzo)
+            except Exception as e:
+                errors += 1
+                print(f"[ERRORE] Varianti {display}: {e}")
 
-            apply_preorder_variants(pid, price)
-            done += 1
+            created += 1
+            # pausa minima per non stressare l'API
+            time.sleep(0.2)
 
         except Exception as e:
-            print(f"[ERRORE] Riga {rownum} '{name}': {e}")
-            errs += 1
+            errors += 1
+            print(f"[ERRORE] Riga '{display}': {e}")
 
-    print(f"[DONE] Creati/Aggiornati: {done}, Errori: {errs}")
-    if errs:
+    print(f"[DONE] Creati/Aggiornati (base): {created}, Errori: {errors}")
+    if errors:
         sys.exit(2)
 
 if __name__ == "__main__":
