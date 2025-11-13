@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: "Percorso CSV"
+        description: "Percorso CSV (default: input/template_preordini_v7.csv)"
         required: false
         default: "input/template_preordini_v7.csv"
 
