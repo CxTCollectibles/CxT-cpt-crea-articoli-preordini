@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, csv, json, time
+import os, sys, csv, json
 import requests
 
 BASE = "https://www.wixapis.com"
@@ -31,7 +31,6 @@ def req(method, path, **kw):
     url = BASE + path
     r = requests.request(method, url, headers=headers(), timeout=30, **kw)
     if r.status_code >= 400:
-        msg = ""
         try:
             msg = r.json()
         except Exception:
@@ -64,7 +63,7 @@ def fmt_description(deadline, eta, descr):
     if eta:      top.append(f"ETA: {eta}")
     above = "<br>".join(top)
     body = (descr or "").strip()
-    # riga vuota tra header e descrizione
+    # riga vuota tra intestazione e corpo
     if above and body:
         html = f"<div><p>{above}</p><p></p><p>{body.replace('\\n','<br>')}</p></div>"
     elif above:
@@ -81,25 +80,82 @@ def get_collections():
     return out
 
 def find_product_by_sku(sku):
-    # query v1
     body = {"query": {"filter": {"sku": sku}, "paging": {"limit": 1}}}
     data = req("POST", "/stores/v1/products/query", json=body)
     items = data.get("products", [])
     return items[0] if items else None
 
+def upsert_variants(pid, price):
+    # calcoli prezzi
+    as_price = round(price * 0.30, 2)  # 30% anticipo
+    pa_price = round(price * 0.95, 2)  # 5% sconto pagamento anticipato
+
+    # leggo varianti esistenti
+    v = req("GET", f"/stores/v1/products/{pid}/variants?limit=100")
+    variants = v.get("variants", [])
+    # mappa scelte
+    m = {}
+    for var in variants:
+        choices = {c.get("option"): c.get("value") for c in var.get("choices", [])}
+        key = choices.get(OPTION_TITLE)
+        if key:
+            m[key] = var["id"]
+
+    patch = []
+    if CHOICE_AS in m:
+        patch.append({"id": m[CHOICE_AS], "priceData": {"price": as_price}})
+    if CHOICE_PA in m:
+        patch.append({"id": m[CHOICE_PA], "priceData": {"price": pa_price}})
+
+    if patch:
+        req("PATCH", f"/stores/v1/products/{pid}/variants", json={"variants": patch})
+        print(f"[OK] Prezzi varianti: {CHOICE_AS}={as_price} EUR, {CHOICE_PA}={pa_price} EUR")
+    else:
+        print(f"[WARN] Varianti non trovate, provo a crearle con manageVariants=True…")
+        # forzo lo schema opzioni
+        req("PATCH", f"/stores/v1/products/{pid}", json={
+            "product": {
+                "manageVariants": True,
+                "productOptions": [{
+                    "name": OPTION_TITLE,
+                    "type": "dropDown",
+                    "choices": [
+                        {"value": CHOICE_AS, "description": CHOICE_AS},
+                        {"value": CHOICE_PA, "description": CHOICE_PA}
+                    ]
+                }]
+            }
+        })
+        v2 = req("GET", f"/stores/v1/products/{pid}/variants?limit=100").get("variants", [])
+        m2 = {}
+        for var in v2:
+            choices = {c.get("option"): c.get("value") for c in var.get("choices", [])}
+            key = choices.get(OPTION_TITLE)
+            if key:
+                m2[key] = var["id"]
+        patch2 = []
+        if CHOICE_AS in m2:
+            patch2.append({"id": m2[CHOICE_AS], "priceData": {"price": as_price}})
+        if CHOICE_PA in m2:
+            patch2.append({"id": m2[CHOICE_PA], "priceData": {"price": pa_price}})
+        if patch2:
+            req("PATCH", f"/stores/v1/products/{pid}/variants", json={"variants": patch2})
+            print(f"[OK] Varianti create + prezzi applicati.")
+        else:
+            print(f"[WARN] Non riesco a creare le varianti, controllo manuale necessario.")
+
 def create_or_update_product(row):
     name = trunc_name(row["nome_articolo"].strip())
     price = parse_price(row["prezzo_eur"])
     sku = row["sku"].strip()
-    brand = row["brand"].strip()
-    categoria = row["categoria"].strip()
+    brand = (row.get("brand") or "").strip()
+    categoria = (row.get("categoria") or "").strip()
     deadline = (row.get("preorder_scadenza") or "").strip()
     eta = (row.get("eta") or "").strip()
     descr = (row.get("descrizione") or "").strip()
 
     desc_html = fmt_description(deadline, eta, descr)
 
-    # Pre-esistente?
     existing = None
     try:
         existing = find_product_by_sku(sku)
@@ -108,7 +164,6 @@ def create_or_update_product(row):
 
     product_payload = {
         "name": name,
-        "slug": None,
         "productType": "physical",
         "sku": sku,
         "visible": True,
@@ -117,64 +172,32 @@ def create_or_update_product(row):
         "price": {"currency": CURRENCY, "price": price},
         "description": desc_html,
         "manageVariants": True,
-        "productOptions": [
-            {
-                "name": OPTION_TITLE,
-                "type": "dropDown",
-                "choices": [
-                    {"value": CHOICE_AS, "description": CHOICE_AS},
-                    {"value": CHOICE_PA, "description": CHOICE_PA}
-                ]
-            }
-        ],
+        "productOptions": [{
+            "name": OPTION_TITLE,
+            "type": "dropDown",
+            "choices": [
+                {"value": CHOICE_AS, "description": CHOICE_AS},
+                {"value": CHOICE_PA, "description": CHOICE_PA}
+            ]
+        }]
     }
 
     if existing:
         pid = existing["id"]
-        try:
-            req("PATCH", f"/stores/v1/products/{pid}", json={"product": product_payload})
-            print(f"[UPD] {name} (SKU={sku})")
-        except Exception as e:
-            raise RuntimeError(f"PATCH /products/{pid} fallita: {e}")
+        req("PATCH", f"/stores/v1/products/{pid}", json={"product": product_payload})
+        print(f"[UPD] {name} (SKU={sku})")
     else:
-        try:
-            data = req("POST", "/stores/v1/products", json={"product": product_payload})
-            pid = data["product"]["id"]
-            print(f"[NEW] {name} (SKU={sku})")
-        except Exception as e:
-            raise RuntimeError(f"POST /products fallita: {e}")
+        data = req("POST", "/stores/v1/products", json={"product": product_payload})
+        pid = data["product"]["id"]
+        print(f"[NEW] {name} (SKU={sku})")
 
-    # Varianti: prezzi
+    # Varianti e prezzi
     try:
-        v = req("GET", f"/stores/v1/products/{pid}/variants?limit=100")
-        variants = v.get("variants", [])
-        id_as = id_pa = None
-        for var in variants:
-            # var["choices"] è una lista di dict { "option": title, "value": value }
-            choices = {c.get("option"): c.get("value") for c in var.get("choices", [])}
-            if choices.get(OPTION_TITLE) == CHOICE_AS:
-                id_as = var["id"]
-            if choices.get(OPTION_TITLE) == CHOICE_PA:
-                id_pa = var["id"]
-
-        as_price = round(price * 0.30, 2)
-        pa_price = round(price * 0.95, 2)
-
-        patch_list = []
-        if id_as:
-            patch_list.append({"id": id_as, "priceData": {"price": as_price}})
-        if id_pa:
-            patch_list.append({"id": id_pa, "priceData": {"price": pa_price}})
-
-        if patch_list:
-            req("PATCH", f"/stores/v1/products/{pid}/variants", json={"variants": patch_list})
-            print(f"[OK] Prezzi varianti aggiornati: {CHOICE_AS}={as_price} EUR, {CHOICE_PA}={pa_price} EUR")
-        else:
-            print(f"[WARN] Varianti non trovate per {name}.")
+        upsert_variants(pid, price)
     except Exception as e:
         print(f"[WARN] Patch varianti fallita: {e}")
 
-    # Collezione
+    # Categoria
     if categoria:
         try:
             collections = get_collections()
@@ -184,13 +207,11 @@ def create_or_update_product(row):
                     req("POST", f"/stores/v1/collections/{cid}/products/add", json={"productIds": [pid]})
                     print(f"[OK] Categoria assegnata: {categoria}")
                 except Exception as e:
-                    print(f"[WARN] Impossibile aggiungere a '{categoria}' (smart collection o permesso): {e}")
+                    print(f"[WARN] Impossibile aggiungere a '{categoria}': {e}")
             else:
                 print(f"[WARN] Collezione '{categoria}' non trovata.")
         except Exception as e:
             print(f"[WARN] Lettura collezioni fallita: {e}")
-
-    return pid
 
 def main():
     if len(sys.argv) < 2:
@@ -198,22 +219,18 @@ def main():
         sys.exit(2)
     csv_path = sys.argv[1]
     print(f"[INFO] CSV: {csv_path}")
-    created = updated = errors = 0
 
+    errs = 0
     for row in read_csv(csv_path):
         name = trunc_name(row["nome_articolo"].strip())
-        sku = row["sku"].strip()
         try:
-            pid = create_or_update_product(row)
-            if pid:
-                # stima: se esisteva è update, altrimenti new (log già stampato)
-                updated += 1
+            create_or_update_product(row)
         except Exception as e:
-            errors += 1
+            errs += 1
             print(f"[ERRORE] '{name}': {e}")
 
-    print(f"[DONE] Errori: {errors}")
-    if errors:
+    print(f"[DONE] Errori: {errs}")
+    if errs:
         sys.exit(2)
 
 if __name__ == "__main__":
