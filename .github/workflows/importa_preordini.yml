@@ -8,9 +8,9 @@ on:
         required: true
         default: "input/template_preordini_v7.csv"
       deposit_percent:
-        description: "Percentuale acconto (es. 0.20 = 20%)"
+        description: "Percentuale acconto (es. 0.30 = 30%)"
         required: false
-        default: "0.20"
+        default: "0.30"
       rate_installments:
         description: "Numero rate per PAGAMENTO RATEALE"
         required: false
