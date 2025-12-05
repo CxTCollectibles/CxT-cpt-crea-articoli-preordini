@@ -1,24 +1,12 @@
-name: Importa Preordini (Wix)
+name: Importa Preordini Wix
 
 on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: "Percorso CSV (da XLS v7 esportato, delimitatore ';')"
+        description: "Percorso CSV (da XLS V7)"
         required: true
         default: "input/template_preordini_v7.csv"
-      deposit_percent:
-        description: "Percentuale acconto (es. 0.30 = 30%)"
-        required: false
-        default: "0.30"
-      rate_installments:
-        description: "Numero rate per PAGAMENTO RATEALE"
-        required: false
-        default: "3"
-      rate_surcharge_percent:
-        description: "Sovrapprezzo rateale (0.0 = nessuno)"
-        required: false
-        default: "0.0"
 
 jobs:
   run:
@@ -37,16 +25,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Esegui importazione
+      - name: Esegui import
         env:
           WIX_API_KEY: ${{ secrets.WIX_API_KEY }}
           WIX_SITE_ID: ${{ secrets.WIX_SITE_ID }}
-          CSV_PATH: ${{ inputs.csv_path }}
-          CURRENCY: "EUR"
-          DEPOSIT_PERCENT: ${{ inputs.deposit_percent }}
-          RATE_INSTALLMENTS: ${{ inputs.rate_installments }}
-          RATE_SURCHARGE_PERCENT: ${{ inputs.rate_surcharge_percent }}
+          DEPOSIT_PCT: "0.30"     # cambia qui se vuoi un anticipo diverso
+          CSV_PATH: ${{ github.event.inputs.csv_path }}
         run: |
-          set -e
-          echo "[INFO] CSV: ${CSV_PATH}"
-          python wix_preorder_ingestion.py
+          python wix_preorder_ingestion.py "$CSV_PATH"
