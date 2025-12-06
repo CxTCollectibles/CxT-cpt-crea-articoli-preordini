@@ -13,21 +13,12 @@ WIX_API_KEY = os.environ.get("WIX_API_KEY", "").strip()
 WIX_SITE_ID = os.environ.get("WIX_SITE_ID", "").strip()
 CSV_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("CSV_PATH", "input/template_preordini_v7.csv")
 
-# Percentuale anticipo: default 30% (configurabile via env)
-def _pct_env(val: str, default: float) -> float:
-    try:
-        return float(os.environ.get(val, str(default)))
-    except Exception:
-        return default
-
-DEPOSIT_PCT = _pct_env("DEPOSIT_PCT", 0.30)
-
 def headers() -> Dict[str, str]:
     if not WIX_API_KEY or not WIX_SITE_ID:
         print("[FATAL] Variabili WIX_API_KEY o WIX_SITE_ID mancanti.", file=sys.stderr)
         sys.exit(1)
     return {
-        "Authorization": f"Bearer {WIX_API_KEY}",
+        "Authorization": f"Bearer {WIX_API_KEY}",  # formati che ti funzionavano
         "wix-site-id": WIX_SITE_ID,
         "Content-Type": "application/json"
     }
@@ -56,10 +47,11 @@ def build_description(preorder_deadline: str, eta: str, descr_it: str) -> str:
     di_html = di.replace("\n", "<br>")
     parts = []
     if pd:
-        parts.append(f"<p><strong>Preorder Deadline:</strong> {pd}</p>")
+        parts.append(f"<p><strong>Preorder Deadline:</strong> {pd} <em>Salvo esaurimento</em></p>")
+        parts.append("<p>&nbsp;</p>")  # riga vuota subito dopo la deadline
     if et:
         parts.append(f"<p><strong>ETA:</strong> {et}</p>")
-    parts.append("<p>&nbsp;</p>")  # riga vuota di separazione
+    parts.append("<p>&nbsp;</p>")  # riga vuota di separazione dalla descrizione
     if di_html:
         parts.append(f"<p>{di_html}</p>")
     return "\n".join(parts)
@@ -84,7 +76,7 @@ def create_product(row: Dict[str, str]) -> str:
     descr_html = build_description(preorder_scadenza, eta, descr)
 
     product: Dict[str, Any] = {
-        "name": nome[:80] if nome else sku,
+        "name": (nome[:80] if nome else sku),
         "productType": "physical",   # enum accetta "physical"
         "sku": sku,
         "priceData": {"currency": "EUR", "price": eur(prezzo)},
@@ -92,7 +84,7 @@ def create_product(row: Dict[str, str]) -> str:
         "visible": True
     }
     if brand:
-        # IMPORTANTISSIMO: brand deve essere STRINGA in v1, non oggetto
+        # In v1 brand è stringa semplice
         product["brand"] = brand
 
     body = {"product": product}
@@ -103,6 +95,7 @@ def create_product(row: Dict[str, str]) -> str:
     return pid
 
 def patch_add_option(product_id: str):
+    # Aggiungiamo SOLO l'opzione con 3 scelte. Nessuna gestione prezzi qui.
     option_name = "PREORDER PAYMENTS OPTIONS*"
     body = {
         "product": {
@@ -113,35 +106,9 @@ def patch_add_option(product_id: str):
                     "type": "drop_down",
                     "choices": [
                         {"value": "AS", "description": "ANTICIPO/SALDO"},
-                        {"value": "PA", "description": "PAGAMENTO ANTICIPATO"}
+                        {"value": "PA", "description": "PAGAMENTO ANTICIPATO"},
+                        {"value": "PR", "description": "PAGAMENTO RATEALE"}
                     ]
-                }
-            ]
-        }
-    }
-    # Imposto l'opzione prima, in una PATCH dedicata
-    req("PATCH", f"/stores/v1/products/{product_id}", body, ok=(200,))
-
-def patch_add_variants(product_id: str, sku_base: str, full_price: float):
-    option_name = "PREORDER PAYMENTS OPTIONS*"
-    price_deposit = eur(full_price * DEPOSIT_PCT)
-    price_full = eur(full_price)
-
-    # Le varianti referenziano l’OPZIONE tramite il suo "name" e la SCELTA tramite la "description"
-    body = {
-        "product": {
-            "variants": [
-                {
-                    "choices": { option_name: "ANTICIPO/SALDO" },
-                    "priceData": {"currency": "EUR", "price": price_deposit},
-                    "visible": True,
-                    "sku": f"{sku_base}-AS"
-                },
-                {
-                    "choices": { option_name: "PAGAMENTO ANTICIPATO" },
-                    "priceData": {"currency": "EUR", "price": price_full},
-                    "visible": True,
-                    "sku": f"{sku_base}-PA"
                 }
             ]
         }
@@ -151,12 +118,14 @@ def patch_add_variants(product_id: str, sku_base: str, full_price: float):
 def load_csv(path: str):
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh, delimiter=";")
-        # Minimo indispensabile del tuo XLS V7
         expected = ["nome_articolo","prezzo_eur","sku","brand","descrizione","preorder_scadenza","eta"]
         missing = [c for c in expected if c not in reader.fieldnames]
         if missing:
             print(f"[WARN] CSV colonne mancanti: {missing}. Procedo comunque.")
         for row in reader:
+            # Skippa righe palesemente vuote
+            if not (row.get("sku") or "").strip() and not (row.get("nome_articolo") or "").strip():
+                continue
             yield row
 
 def main():
@@ -180,26 +149,18 @@ def main():
             pid = create_product(row)
             print(f"[NEW] Creato {sku} -> {pid}")
 
-            # Passo 1: opzioni
+            # 1) Aggiungo l'opzione con le 3 scelte (niente prezzi)
             try:
                 patch_add_option(pid)
             except Exception as e:
                 errors += 1
                 print(f"[ERRORE] Opzioni {display}: {e}")
-                continue  # senza opzioni non ha senso aggiungere varianti
+                continue
 
-            # Leggera attesa, Wix a volte è... lunatico
-            time.sleep(0.3)
-
-            # Passo 2: varianti con prezzi
-            try:
-                patch_add_variants(pid, sku, prezzo)
-            except Exception as e:
-                errors += 1
-                print(f"[ERRORE] Varianti {display}: {e}")
+            # piccola attesa di grazia
+            time.sleep(0.2)
 
             created += 1
-            time.sleep(0.2)
 
         except Exception as e:
             errors += 1
